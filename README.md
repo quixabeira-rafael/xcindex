@@ -197,14 +197,20 @@ git clone https://github.com/quixabeira-rafael/xcindex
 cd xcindex
 python3.13 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
-.venv/bin/pytest tests/unit -v             # fast, ~3s, 100+ tests
-.venv/bin/pytest tests -v -m integration   # full suite, requires Xcode + Swift
+.venv/bin/pytest tests/unit -v             # fast, ~3s, ~95 unit tests
+.venv/bin/pytest tests -v -m integration   # full suite (~40s), 156 tests, requires Xcode + Swift
 ```
 
 Layout:
 - `src/xcindex/` — Python package
 - `swift-helper/` — SwiftPM package; produces `xcindex-helper` binary
-- `tests/fixtures/SampleApp/` — minimal SwiftPM project for integration tests
+- `tests/fixtures/SampleApp/` — SwiftPM project that exercises the full IndexStore
+  data model: 14 symbol kinds (class, struct, protocol, enum + cases, typealias,
+  destructor, generic / static / instance methods, etc.), 8 sub_kinds (subscript,
+  prefix/infix operators, generic-type-param, associated-type, didSet, getter/setter),
+  7 relation kinds (childOf, containedBy, calledBy, receivedBy, overrideOf, baseOf,
+  extendedBy), and 7 occurrence roles. `tests/integration/test_primitive_coverage.py`
+  asserts each primitive survives end-to-end through the helper, the cache, and the CLI.
 
 ## Exit codes
 
