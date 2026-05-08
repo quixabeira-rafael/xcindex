@@ -124,14 +124,20 @@ def test_relations_out_finds_protocol_conformers(built_fixture, built_helper, is
     assert "PriceCalculator" in names
 
 
-def test_relations_out_finds_method_overriders(built_fixture, built_helper, isolated_cache):
+def test_relations_in_finds_method_overriders(built_fixture, built_helper, isolated_cache):
+    """Who overrides PriceCalculator.compute? → DiscountedPriceCalculator.compute.
+
+    `--direction in` returns occurrences of OTHER symbols whose relations point at
+    the anchor; combined with `--kind overrideOf` this answers "who overrides me".
+    """
     payload = _xcindex(
-        ["relations", COMPUTE_USR, "--direction", "out", "--kind", "overrideOf",
+        ["relations", COMPUTE_USR, "--direction", "in", "--kind", "overrideOf",
          "--level", "locations"],
         FIXTURE_ROOT, _env(built_helper),
     )
-    if not payload["summary"]["found"]:
-        pytest.skip("override relation not emitted in this index store layout")
+    assert payload["summary"]["found"], (
+        "expected DiscountedPriceCalculator.compute to register as an overrider"
+    )
     names = {it["name"] for it in payload["items"]}
     assert any("compute" in (n or "") for n in names)
 
