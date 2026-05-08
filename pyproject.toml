@@ -38,8 +38,11 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/xcindex"]
 
+# Bundle only the SwiftPM sources, never `.build/` / `.swiftpm/` artifacts —
+# those carry absolute build paths that break PCH caches on the install host.
 [tool.hatch.build.targets.wheel.force-include]
-"swift-helper" = "xcindex/_swift_helper_src"
+"swift-helper/Package.swift" = "xcindex/_swift_helper_src/Package.swift"
+"swift-helper/Sources" = "xcindex/_swift_helper_src/Sources"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
