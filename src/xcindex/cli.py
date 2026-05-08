@@ -15,6 +15,7 @@ from xcindex.commands import reach as reach_commands
 from xcindex.commands import relations as relations_commands
 from xcindex.commands import search as search_commands
 from xcindex.commands import setup as setup_commands
+from xcindex.commands import skill as skill_commands
 from xcindex.commands import symbol as symbol_commands
 from xcindex.output import EXIT_SYSTEM, EXIT_USAGE, emit_error
 
@@ -28,6 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
 
     setup_commands.register(subparsers)
+    skill_commands.register(subparsers)
     doctor_commands.register(subparsers)
     cache_commands.register(subparsers)
     at_commands.register(subparsers)
