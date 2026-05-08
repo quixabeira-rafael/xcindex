@@ -1,0 +1,122 @@
+from __future__ import annotations
+
+import sqlite3
+from typing import Any
+
+SCHEMA_VERSION = 1
+
+CREATE_STATEMENTS = (
+    """
+    CREATE TABLE IF NOT EXISTS symbols (
+      usr        TEXT PRIMARY KEY,
+      name       TEXT NOT NULL,
+      kind       TEXT NOT NULL,
+      sub_kind   TEXT,
+      language   TEXT NOT NULL,
+      module     TEXT,
+      file       TEXT,
+      line       INTEGER,
+      is_system  INTEGER NOT NULL DEFAULT 0,
+      properties INTEGER NOT NULL DEFAULT 0
+    ) WITHOUT ROWID;
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS occurrences (
+      id            INTEGER PRIMARY KEY,
+      symbol_usr    TEXT NOT NULL,
+      file          TEXT NOT NULL,
+      line          INTEGER NOT NULL,
+      column        INTEGER NOT NULL,
+      roles         INTEGER NOT NULL,
+      container_usr TEXT,
+      unit_name     TEXT
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS relations (
+      occurrence_id INTEGER NOT NULL,
+      related_usr   TEXT NOT NULL,
+      related_name  TEXT,
+      kind          TEXT NOT NULL,
+      roles         INTEGER NOT NULL
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS units (
+      name       TEXT PRIMARY KEY,
+      main_file  TEXT,
+      module     TEXT,
+      target     TEXT,
+      provider   TEXT,
+      mtime_ns   INTEGER NOT NULL DEFAULT 0
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS files (
+      path      TEXT PRIMARY KEY,
+      mtime_ns  INTEGER
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS meta (
+      key   TEXT PRIMARY KEY,
+      value TEXT
+    );
+    """,
+)
+
+INDEX_STATEMENTS = (
+    "CREATE INDEX IF NOT EXISTS idx_sym_module       ON symbols(module);",
+    "CREATE INDEX IF NOT EXISTS idx_sym_kind         ON symbols(kind);",
+    "CREATE INDEX IF NOT EXISTS idx_sym_name_nocase  ON symbols(name COLLATE NOCASE);",
+    "CREATE INDEX IF NOT EXISTS idx_occ_symbol       ON occurrences(symbol_usr);",
+    "CREATE INDEX IF NOT EXISTS idx_occ_file_line    ON occurrences(file, line, column);",
+    "CREATE INDEX IF NOT EXISTS idx_occ_container    ON occurrences(container_usr);",
+    "CREATE INDEX IF NOT EXISTS idx_occ_unit         ON occurrences(unit_name);",
+    "CREATE INDEX IF NOT EXISTS idx_rel_related_kind ON relations(related_usr, kind);",
+    "CREATE INDEX IF NOT EXISTS idx_rel_occ          ON relations(occurrence_id);",
+)
+
+
+def apply_schema(conn: sqlite3.Connection) -> None:
+    cursor = conn.cursor()
+    for stmt in CREATE_STATEMENTS:
+        cursor.execute(stmt)
+    conn.commit()
+
+
+def apply_indexes(conn: sqlite3.Connection) -> None:
+    cursor = conn.cursor()
+    for stmt in INDEX_STATEMENTS:
+        cursor.execute(stmt)
+    conn.commit()
+
+
+def write_meta(conn: sqlite3.Connection, **values: Any) -> None:
+    cursor = conn.cursor()
+    cursor.executemany(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+        [(key, str(value)) for key, value in values.items()],
+    )
+    conn.commit()
+
+
+def read_meta(conn: sqlite3.Connection) -> dict[str, str]:
+    cursor = conn.cursor()
+    cursor.execute("SELECT key, value FROM meta")
+    return dict(cursor.fetchall())
+
+
+def configure_for_dump(conn: sqlite3.Connection) -> None:
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA synchronous = OFF")
+    cursor.execute("PRAGMA journal_mode = MEMORY")
+    cursor.execute("PRAGMA temp_store = MEMORY")
+    cursor.execute("PRAGMA cache_size = -65536")
+
+
+def configure_for_query(conn: sqlite3.Connection) -> None:
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA mmap_size = 268435456")
+    cursor.execute("PRAGMA cache_size = -65536")
+    cursor.execute("PRAGMA query_only = ON")
