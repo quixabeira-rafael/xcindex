@@ -43,8 +43,11 @@ def add_project_arguments(parser: argparse.ArgumentParser) -> None:
                         help="Path to DerivedData root (overrides default).")
     parser.add_argument("--include-system", action="store_true",
                         help="Include SDK / system symbols in the dump (default: false).")
+    parser.add_argument("--check-fresh", action="store_true",
+                        help="Walk the project tree to detect source files newer than the index "
+                             "(emits a warning if stale; default: skipped on large projects).")
     parser.add_argument("--require-fresh", action="store_true",
-                        help="Fail with EXIT_STALE_INDEX if any source file is newer than the index.")
+                        help="Like --check-fresh, but fails with EXIT_STALE_INDEX instead of warning.")
 
 
 def resolve_project(args: argparse.Namespace) -> discovery.ProjectInfo:
@@ -114,12 +117,15 @@ def open_context(
 
     warnings: list[str] = []
     is_stale = False
-    staleness = _detect_staleness(project, index_store)
-    if staleness is not None:
-        is_stale = True
-        warnings.append(staleness)
-        if getattr(args, "require_fresh", False):
-            raise StaleIndexError(staleness)
+    require_fresh = getattr(args, "require_fresh", False)
+    check_fresh = getattr(args, "check_fresh", False)
+    if require_fresh or check_fresh:
+        staleness = _detect_staleness(project, index_store)
+        if staleness is not None:
+            is_stale = True
+            warnings.append(staleness)
+            if require_fresh:
+                raise StaleIndexError(staleness)
 
     context = ProjectContext(
         project=project,
