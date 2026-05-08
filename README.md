@@ -154,13 +154,21 @@ The agent can then trigger a rebuild before relying on the result.
 
 ## Performance
 
-| Scenario | Latency (small project) | Latency (large project, ~340k symbols) |
+| Scenario | Small project | Large project (~340k symbols) |
 |---|---|---|
-| First-ever query (cold bootstrap) | ~1–5s | ~2–3 min |
+| First-ever query (cold bootstrap) | < 1s | **~15–20s** |
 | Warm cache hit (no IndexStore changes) | < 50ms | < 500ms |
-| After Xcode incremental rebuild of N files | ~1s + dump-files | ~5–15s |
+| After Xcode incremental rebuild of N files | < 1s | ~3–10s |
 | After adding a brand-new source file | full re-bootstrap | full re-bootstrap |
 | `reach` warm | < 200ms | < 200ms |
+
+In v3 (Path E) the Swift helper writes the SQLite cache **directly** through
+`libsqlite3` — no NDJSON, no Python ingest, no IPC. The helper walks the
+IndexStore via the lower-level `IndexStore` Swift wrapper (Apple's
+`indexstore-db` package), opening unit and record readers in sequence rather
+than issuing per-symbol queries. The combined effect on a real iOS workspace
+(WWMobileProject, ~342k symbols, 1.5M relations) is a cold dump in ~15–20s
+versus ~3 minutes in v2.
 
 The cache lives at `~/.cache/xcindex/<project-fingerprint>/index.sqlite` and is
 **mutable, atomically updated in place**. xcindex tracks each unit's `(size,
@@ -168,14 +176,16 @@ mtime)` in the cache; on every query it reads the current `Index.noindex/v5/unit
 listing in milliseconds and computes a delta:
 
 - **No changes** → cache hit, query directly.
-- **Modified units only** → ask the helper for the affected source files, replace
-  their rows in SQLite. Symbols defined elsewhere are untouched.
-- **Removed units** → drop their rows.
+- **Modified units only** → invoke the helper's `incremental` subcommand, which
+  opens the SQLite, deletes rows for affected files, re-walks the changed
+  records, INSERTs the new rows, all in one transaction.
+- **Removed units** → helper drops their rows.
 - **Added units (new source files)** → fall back to a full re-bootstrap.
 
-Pre-v2 caches (multiple `<hash>.sqlite` files) are preserved as
-`legacy_<hash>.sqlite` snapshots; up to three of them are kept around for
-forensics, then GC'd.
+Pre-v3 caches (`schema_version != 3`) are detected and rebuilt on first
+invocation. v1/v2 `<hash>.sqlite` snapshots from earlier versions are
+preserved as `legacy_<hash>.sqlite` for forensics; up to three are kept,
+then GC'd.
 
 ## Limitations
 
@@ -197,7 +207,7 @@ xcindex (Python CLI)
   │       └─ IndexStoreDB (Apple)
   │              └─ libIndexStore.dylib (in Xcode toolchain)
   │
-  └─ SQLite cache (~/.cache/xcindex/<project>/index.sqlite, updated in place)
+  └─ SQLite cache (~/.cache/xcindex/<project>/index.sqlite, written by Swift helper directly)
 ```
 
 Source of truth is always the IndexStore. The SQLite cache is materialized

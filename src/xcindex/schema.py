@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 CREATE_STATEMENTS = (
     """
@@ -81,7 +81,6 @@ INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS idx_occ_file_line    ON occurrences(file, line, column);",
     "CREATE INDEX IF NOT EXISTS idx_occ_container    ON occurrences(container_usr);",
     "CREATE INDEX IF NOT EXISTS idx_occ_unit         ON occurrences(unit_name);",
-    "CREATE INDEX IF NOT EXISTS idx_occ_file         ON occurrences(file);",
     "CREATE INDEX IF NOT EXISTS idx_rel_related_kind ON relations(related_usr, kind);",
     "CREATE INDEX IF NOT EXISTS idx_rel_occ          ON relations(occurrence_id);",
     "CREATE INDEX IF NOT EXISTS idx_unit_files_file  ON unit_files(file);",
@@ -127,20 +126,6 @@ def write_meta(conn: sqlite3.Connection, **values: Any) -> None:
         [(key, str(value)) for key, value in values.items()],
     )
     conn.commit()
-
-
-def read_meta(conn: sqlite3.Connection) -> dict[str, str]:
-    cursor = conn.cursor()
-    cursor.execute("SELECT key, value FROM meta")
-    return dict(cursor.fetchall())
-
-
-def configure_for_dump(conn: sqlite3.Connection) -> None:
-    cursor = conn.cursor()
-    cursor.execute("PRAGMA synchronous = OFF")
-    cursor.execute("PRAGMA journal_mode = MEMORY")
-    cursor.execute("PRAGMA temp_store = MEMORY")
-    cursor.execute("PRAGMA cache_size = -65536")
 
 
 def configure_for_query(conn: sqlite3.Connection) -> None:

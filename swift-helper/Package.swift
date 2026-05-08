@@ -1,4 +1,4 @@
-// swift-tools-version:5.9
+// swift-tools-version:6.2
 import PackageDescription
 
 let package = Package(
@@ -16,9 +16,18 @@ let package = Package(
         .executableTarget(
             name: "xcindex-helper",
             dependencies: [
-                .product(name: "IndexStoreDB", package: "indexstore-db"),
+                // Lower-level Swift wrapper of the raw libIndexStore C API.
+                .product(name: "IndexStore", package: "indexstore-db"),
             ],
-            path: "Sources/xcindex-helper"
+            path: "Sources/xcindex-helper",
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+                .enableExperimentalFeature("Lifetimes"),
+            ],
+            linkerSettings: [
+                // libsqlite3 ships with macOS; the helper writes the cache through it.
+                .linkedLibrary("sqlite3"),
+            ]
         ),
     ]
 )

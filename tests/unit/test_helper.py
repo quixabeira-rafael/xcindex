@@ -87,47 +87,6 @@ def test_ensure_helper_raises_when_disallowed(monkeypatch, tmp_path: Path):
         helper.ensure_helper(allow_build=False)
 
 
-def test_stream_dump_yields_parsed_records(tmp_path: Path):
-    binary = tmp_path / "fake-dump"
-    binary.write_text(
-        "#!/bin/bash\n"
-        'echo \'{"type":"symbol","usr":"s:1","name":"foo"}\'\n'
-        'echo \'{"type":"occurrence","id":1,"symbol_usr":"s:1"}\'\n'
-        'exit 0\n'
-    )
-    binary.chmod(0o755)
-    store = tmp_path / "store"
-    (store / "v5" / "units").mkdir(parents=True)
-    records = list(helper.stream_dump(store, helper_path=binary))
-    assert len(records) == 2
-    assert records[0]["type"] == "symbol"
-    assert records[1]["type"] == "occurrence"
-
-
-def test_stream_dump_raises_on_invalid_json(tmp_path: Path):
-    binary = tmp_path / "bad"
-    binary.write_text("#!/bin/bash\necho 'not json'\nexit 0\n")
-    binary.chmod(0o755)
-    store = tmp_path / "store"
-    (store / "v5" / "units").mkdir(parents=True)
-    with pytest.raises(helper.HelperError, match="non-JSON"):
-        list(helper.stream_dump(store, helper_path=binary))
-
-
-def test_stream_dump_raises_on_helper_failure(tmp_path: Path):
-    binary = tmp_path / "fail"
-    binary.write_text(
-        "#!/bin/bash\n"
-        'echo "boom" >&2\n'
-        'exit 5\n'
-    )
-    binary.chmod(0o755)
-    store = tmp_path / "store"
-    (store / "v5" / "units").mkdir(parents=True)
-    with pytest.raises(helper.HelperError, match="exit 5"):
-        list(helper.stream_dump(store, helper_path=binary))
-
-
 def test_helper_source_dir_dev_mode():
     source = helper.helper_source_dir()
     assert (source / "Package.swift").is_file()

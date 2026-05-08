@@ -8,9 +8,8 @@ import sys
 from dataclasses import dataclass
 from importlib.resources import files as resource_files
 from pathlib import Path
-from typing import Iterator
 
-from xcindex import __version__ as XCINDEX_VERSION
+from xcindex import schema as schema_module
 
 ENV_HELPER = "XCINDEX_HELPER"
 ENV_HELPER_SOURCE = "XCINDEX_HELPER_SOURCE"
@@ -18,7 +17,7 @@ ENV_HELPER_SOURCE = "XCINDEX_HELPER_SOURCE"
 INSTALLED_HELPER_DIR = Path.home() / ".local" / "share" / "xcindex" / "bin"
 INSTALLED_HELPER = INSTALLED_HELPER_DIR / "xcindex-helper"
 
-EXPECTED_SCHEMA_VERSION = 2
+EXPECTED_SCHEMA_VERSION = schema_module.SCHEMA_VERSION
 
 
 class HelperError(Exception):
@@ -174,73 +173,127 @@ def get_version(helper_path: Path | None = None) -> HelperVersion:
     )
 
 
-def stream_dump(
+@dataclass(frozen=True)
+class HelperRunResult:
+    wall_seconds: float
+    symbols: int
+    occurrences: int
+    relations: int
+    unit_files: int = 0
+    files_redumped: int = 0
+
+
+def run_bootstrap(
     index_store_path: Path,
+    output_path: Path,
     *,
     include_system: bool = False,
     helper_path: Path | None = None,
-) -> Iterator[dict]:
-    """Yield parsed NDJSON records from the helper's `dump` subcommand.
+) -> HelperRunResult:
+    """Invoke the helper's `bootstrap` subcommand: writes a fresh SQLite at output_path.
 
-    Each yielded record is a dict with `type` in {unit, symbol, occurrence, relation, file_unit}.
-    Stderr lines are forwarded to sys.stderr (the helper writes structured info there).
+    The helper handles atomic staging (writes to <output>.tmp.<pid>, renames on
+    success). On failure, leaves no partial file at the target.
     """
     binary = helper_path or ensure_helper()
-    args = [str(binary), "dump", "--index-store", str(index_store_path)]
+    args = [
+        str(binary), "bootstrap",
+        "--index-store", str(index_store_path),
+        "--output", str(output_path),
+    ]
     if include_system:
         args.append("--include-system")
-    yield from _stream_helper(args, label="dump")
+    summary = _run_helper_to_completion(args, label="bootstrap")
+    return _result_from_summary(summary)
 
 
-def stream_dump_files(
+def run_incremental(
     index_store_path: Path,
-    files: list[Path] | list[str],
+    sqlite_path: Path,
     *,
+    modified_units: list[str] | set[str] = (),
+    removed_units: list[str] | set[str] = (),
     include_system: bool = False,
     helper_path: Path | None = None,
-) -> Iterator[dict]:
-    """Yield NDJSON records for `dump-files` (incremental, file-scoped)."""
+) -> HelperRunResult:
+    """Invoke the helper's `incremental` subcommand against an existing SQLite.
+
+    Helper opens the file, validates schema_version, resolves files via
+    `unit_files`, DELETEs scoped rows, re-walks modified units, INSERTs new
+    rows — all in one transaction. If the cache schema is mismatched the
+    helper exits with code 4; callers should fall back to a full bootstrap.
+    """
     binary = helper_path or ensure_helper()
-    args = [str(binary), "dump-files", "--index-store", str(index_store_path)]
-    for f in files:
-        args.append("--file")
-        args.append(str(f))
+    args = [
+        str(binary), "incremental",
+        "--sqlite", str(sqlite_path),
+        "--index-store", str(index_store_path),
+    ]
+    for unit in modified_units:
+        args.append("--modified-unit")
+        args.append(unit)
+    for unit in removed_units:
+        args.append("--removed-unit")
+        args.append(unit)
     if include_system:
         args.append("--include-system")
-    yield from _stream_helper(args, label="dump-files")
+    try:
+        summary = _run_helper_to_completion(args, label="incremental")
+    except HelperError as exc:
+        if "exit 4" in str(exc):
+            # Schema mismatch — caller should force a full bootstrap.
+            raise StaleSchemaError(str(exc)) from exc
+        raise
+    return _result_from_summary(summary)
 
 
-def _stream_helper(args: list[str], *, label: str) -> Iterator[dict]:
+class StaleSchemaError(HelperError):
+    """Raised when the helper detects an existing SQLite with a different
+    schema version. Callers should treat it as "force full re-bootstrap"."""
+
+
+def _run_helper_to_completion(args: list[str], *, label: str) -> dict:
+    """Run a helper subcommand that emits one JSON summary line on stderr.
+
+    Returns the parsed summary dict; raises HelperError on non-zero exit.
+    """
     process = subprocess.Popen(
         args,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        bufsize=1,
     )
-    assert process.stdout is not None
-    try:
-        for line in process.stdout:
-            line = line.rstrip("\n")
-            if not line:
-                continue
+    stdout_data, stderr_data = process.communicate()
+    if stdout_data:
+        sys.stderr.write(stdout_data)  # forward unexpected stdout
+    if process.returncode != 0:
+        raise HelperError(
+            f"xcindex-helper {label} failed: exit {process.returncode}\nstderr:\n{stderr_data}"
+        )
+    summary: dict = {}
+    for line in stderr_data.splitlines():
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
             try:
-                yield json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise HelperError(f"helper emitted non-JSON line: {exc}\n{line!r}")
-        process.stdout.close()
-    finally:
-        rc = process.wait()
-        stderr_output = ""
-        if process.stderr is not None:
-            stderr_output = process.stderr.read()
-            process.stderr.close()
-        if rc != 0:
-            raise HelperError(
-                f"xcindex-helper {label} failed: exit {rc}\nstderr:\n{stderr_output}"
-            )
-        if stderr_output:
-            sys.stderr.write(stderr_output)
+                parsed = json.loads(line)
+                if isinstance(parsed, dict) and parsed.get("info"):
+                    summary = parsed
+            except json.JSONDecodeError:
+                continue
+    if stderr_data and not summary:
+        sys.stderr.write(stderr_data)
+    return summary
+
+
+def _result_from_summary(summary: dict) -> HelperRunResult:
+    return HelperRunResult(
+        wall_seconds=float(summary.get("wall_seconds", 0.0)),
+        symbols=int(summary.get("symbols", 0)),
+        occurrences=int(summary.get("occurrences", 0)),
+        relations=int(summary.get("relations", 0)),
+        unit_files=int(summary.get("unit_files", 0)),
+        files_redumped=int(summary.get("files_redumped", 0)),
+    )
 
 
 # --- Internal helpers --------------------------------------------------------

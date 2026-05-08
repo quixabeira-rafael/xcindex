@@ -60,7 +60,7 @@ def sqlite_path_for(project_path: Path, index_hash: str) -> Path:
 
 
 def canonical_sqlite_path(project_path: Path) -> Path:
-    """Path to the live, mutable cache (v2)."""
+    """Path to the live, mutable cache for a project."""
     return project_cache_dir(project_path) / LIVE_SQLITE_NAME
 
 
@@ -196,7 +196,7 @@ def compute_index_hash(
     Inputs:
         - filename, size, mtime_ns of every file in <store>/v5/units/
         - swift_version (USRs change between compiler versions)
-        - helper_version (changes in the helper's NDJSON schema invalidate cached SQLite)
+        - helper_version (helper output shape changes invalidate cached SQLite)
     """
     units_dir = index_store_path / "v5" / "units"
     if not units_dir.exists():

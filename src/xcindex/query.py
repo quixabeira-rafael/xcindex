@@ -72,10 +72,10 @@ def query_at(conn: sqlite3.Connection, file: str, line: int, column: int | None 
 def query_containing(conn: sqlite3.Connection, file: str, line: int) -> dict[str, Any]:
     """Find the symbol(s) containing a given file:line position.
 
-    The query: find any occurrence in the file with role=definition whose symbol's
-    line is <= target line, then find the closest enclosing one whose container
-    chain encloses the target. Simpler heuristic for v1: pick the symbol whose
-    definition line is the largest line <= target and on the same file.
+    Heuristic: pick the symbol whose definition line is the largest value
+    less than or equal to the target line in the same file. Doesn't fully
+    walk the container chain — sufficient for "what method/class is this
+    line inside?" in practice.
     """
     cursor = conn.cursor()
     cursor.execute(
@@ -510,7 +510,7 @@ _ROLE_BITS = (
 )
 _ROLE_BIT_BY_NAME = dict(_ROLE_BITS)
 
-# Relation kinds emitted by the helper (`primaryRelationKind` in main.swift).
+# Relation kinds emitted by the helper (`Mappings.primaryRelationKind`).
 RELATION_KINDS = (
     "childOf", "baseOf", "overrideOf", "receivedBy", "calledBy",
     "extendedBy", "accessorOf", "containedBy", "ibTypeOf", "specializationOf",

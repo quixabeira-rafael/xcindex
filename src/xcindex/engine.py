@@ -10,7 +10,6 @@ from typing import Iterator
 
 from xcindex import cache as cache_module
 from xcindex import discovery
-from xcindex import dumper
 from xcindex import helper as helper_module
 from xcindex import query as query_module
 from xcindex import schema as schema_module
@@ -103,7 +102,9 @@ def open_context(
     )
 
     with cache_module.acquire_lock(project.path):
-        # Migrate any pre-v2 caches before deciding bootstrap vs reuse.
+        # Rename any pre-canonical-name caches to `legacy_*.sqlite` before
+        # deciding bootstrap vs reuse, so they're preserved for forensics
+        # but don't pollute the live cache file path.
         renamed = cache_module.migrate_v1_caches(project.path)
         if renamed:
             sys.stderr.write(
@@ -149,20 +150,40 @@ def open_context(
                 cache_module.gc_caches(project.path)
                 cache_module.write_meta(project.path, latest_hash=index_hash)
             elif not delta.is_empty:
-                stats = incremental_module.apply_incremental_update(
-                    sqlite_path,
-                    delta,
-                    index_store,
-                    helper_binary,
-                    include_system=getattr(args, "include_system", False),
-                )
-                sys.stderr.write(
-                    f"xcindex: incremental update — "
-                    f"modified {len(delta.modified)}, removed {len(delta.removed)} unit(s); "
-                    f"+{stats.symbols} symbols, +{stats.occurrences} occurrences, "
-                    f"+{stats.relations} relations.\n"
-                )
-                cache_module.write_meta(project.path, latest_hash=index_hash)
+                try:
+                    stats = helper_module.run_incremental(
+                        index_store_path=index_store,
+                        sqlite_path=sqlite_path,
+                        modified_units=sorted(delta.modified),
+                        removed_units=sorted(delta.removed),
+                        include_system=getattr(args, "include_system", False),
+                        helper_path=helper_binary,
+                    )
+                except helper_module.StaleSchemaError:
+                    # Cache schema lags behind the helper — tear down and bootstrap fresh.
+                    sys.stderr.write(
+                        "xcindex: cache schema mismatch; running full re-bootstrap.\n"
+                    )
+                    sqlite_path.unlink()
+                    _materialize(
+                        project=project,
+                        index_store=index_store,
+                        sqlite_path=sqlite_path,
+                        index_hash=index_hash,
+                        helper_info=helper_info,
+                        helper_binary=helper_binary,
+                        include_system=getattr(args, "include_system", False),
+                    )
+                    cache_module.gc_caches(project.path)
+                    cache_module.write_meta(project.path, latest_hash=index_hash)
+                else:
+                    sys.stderr.write(
+                        f"xcindex: incremental update — "
+                        f"modified {len(delta.modified)}, removed {len(delta.removed)} unit(s); "
+                        f"+{stats.symbols} symbols, +{stats.occurrences} occurrences, "
+                        f"+{stats.relations} relations ({stats.wall_seconds:.1f}s).\n"
+                    )
+                    cache_module.write_meta(project.path, latest_hash=index_hash)
             # else: cache hit, no work needed
 
     warnings: list[str] = []
@@ -261,34 +282,33 @@ def _materialize(
     helper_info: helper_module.HelperVersion,
     helper_binary: Path,
     include_system: bool,
-) -> dumper.DumpStats:
+) -> helper_module.HelperRunResult:
+    """Run a fresh bootstrap: the helper writes a new SQLite at `sqlite_path`.
+
+    The helper handles the staged-write + atomic-rename pattern itself.
+    """
     sys.stderr.write(
         f"materializing cache for {project.name} (hash={index_hash})... "
     )
     sys.stderr.flush()
-    with cache_module.staged_write(sqlite_path) as temp_path:
-        records = helper_module.stream_dump(
-            index_store,
-            include_system=include_system,
-            helper_path=helper_binary,
-        )
-        stats = dumper.dump_to_sqlite(
-            temp_path,
-            records,
-            index_hash=index_hash,
-            swift_version=helper_info.swift_version,
-            helper_version=helper_info.helper_version,
-        )
-    # Populate the unit snapshot table so future invocations can detect deltas.
+    result = helper_module.run_bootstrap(
+        index_store_path=index_store,
+        output_path=sqlite_path,
+        include_system=include_system,
+        helper_path=helper_binary,
+    )
+    # Stamp the meta table with the index_hash so `xcindex cache list` and
+    # diagnostics keep working. Helper already wrote schema_version, helper_version,
+    # dumped_at, and per-table counts.
     conn = sqlite3.connect(str(sqlite_path))
     try:
-        from xcindex import incremental
-        incremental.refresh_units_snapshot(conn, index_store)
+        schema_module.write_meta(conn, index_hash=index_hash,
+                                  swift_version=helper_info.swift_version)
     finally:
         conn.close()
 
     sys.stderr.write(
-        f"{stats.symbols} symbols, {stats.occurrences} occurrences, "
-        f"{stats.relations} relations.\n"
+        f"{result.symbols} symbols, {result.occurrences} occurrences, "
+        f"{result.relations} relations ({result.wall_seconds:.1f}s).\n"
     )
-    return stats
+    return result
