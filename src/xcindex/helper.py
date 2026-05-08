@@ -18,7 +18,7 @@ ENV_HELPER_SOURCE = "XCINDEX_HELPER_SOURCE"
 INSTALLED_HELPER_DIR = Path.home() / ".local" / "share" / "xcindex" / "bin"
 INSTALLED_HELPER = INSTALLED_HELPER_DIR / "xcindex-helper"
 
-EXPECTED_SCHEMA_VERSION = 1
+EXPECTED_SCHEMA_VERSION = 2
 
 
 class HelperError(Exception):
@@ -83,6 +83,9 @@ def helper_source_dir() -> Path:
 def ensure_helper(*, allow_build: bool = True) -> Path:
     """Return a usable helper binary, building from source if necessary.
 
+    If a helper exists but reports a stale `schema_version`, it is rebuilt so the
+    Python ↔ Swift contract stays in sync after a `pipx reinstall xcindex`.
+
     Raises HelperError if the binary is missing and either:
         - allow_build is False
         - build cannot be performed (Swift toolchain absent)
@@ -90,7 +93,15 @@ def ensure_helper(*, allow_build: bool = True) -> Path:
     """
     existing = locate_helper()
     if existing is not None:
-        return existing
+        try:
+            info = get_version(existing)
+        except HelperError:
+            info = None
+        if info is not None and info.schema_version == EXPECTED_SCHEMA_VERSION:
+            return existing
+        if not allow_build:
+            return existing  # caller will surface the version mismatch
+        # Stale binary — rebuild from source.
     if not allow_build:
         raise HelperError(
             "xcindex-helper binary not found. Run `xcindex setup install` "
@@ -171,14 +182,35 @@ def stream_dump(
 ) -> Iterator[dict]:
     """Yield parsed NDJSON records from the helper's `dump` subcommand.
 
-    Each yielded record is a dict with `type` in {unit, symbol, occurrence, relation}.
+    Each yielded record is a dict with `type` in {unit, symbol, occurrence, relation, file_unit}.
     Stderr lines are forwarded to sys.stderr (the helper writes structured info there).
     """
     binary = helper_path or ensure_helper()
     args = [str(binary), "dump", "--index-store", str(index_store_path)]
     if include_system:
         args.append("--include-system")
+    yield from _stream_helper(args, label="dump")
 
+
+def stream_dump_files(
+    index_store_path: Path,
+    files: list[Path] | list[str],
+    *,
+    include_system: bool = False,
+    helper_path: Path | None = None,
+) -> Iterator[dict]:
+    """Yield NDJSON records for `dump-files` (incremental, file-scoped)."""
+    binary = helper_path or ensure_helper()
+    args = [str(binary), "dump-files", "--index-store", str(index_store_path)]
+    for f in files:
+        args.append("--file")
+        args.append(str(f))
+    if include_system:
+        args.append("--include-system")
+    yield from _stream_helper(args, label="dump-files")
+
+
+def _stream_helper(args: list[str], *, label: str) -> Iterator[dict]:
     process = subprocess.Popen(
         args,
         stdout=subprocess.PIPE,
@@ -205,7 +237,7 @@ def stream_dump(
             process.stderr.close()
         if rc != 0:
             raise HelperError(
-                f"xcindex-helper dump failed: exit {rc}\nstderr:\n{stderr_output}"
+                f"xcindex-helper {label} failed: exit {rc}\nstderr:\n{stderr_output}"
             )
         if stderr_output:
             sys.stderr.write(stderr_output)

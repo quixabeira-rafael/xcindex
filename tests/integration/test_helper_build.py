@@ -41,14 +41,14 @@ def test_helper_version_emits_valid_json(built_helper: Path):
     )
     assert result.returncode == 0
     payload = json.loads(result.stdout)
-    assert payload["helper_version"] == "0.1.0"
+    assert payload["helper_version"] == "0.2.0"
     assert payload["schema_version"] == helper.EXPECTED_SCHEMA_VERSION
     assert "swift" in payload["swift_version"].lower() or payload["swift_version"]
 
 
 def test_get_version_via_python_api(built_helper: Path):
     info = helper.get_version(built_helper)
-    assert info.helper_version == "0.1.0"
+    assert info.helper_version == "0.2.0"
     assert info.schema_version == helper.EXPECTED_SCHEMA_VERSION
     assert info.binary_path == built_helper
 

@@ -111,24 +111,44 @@ RELATION_INSERT = (
     + ") VALUES (" + ",".join(["?"] * len(RELATION_COLS)) + ")"
 )
 
-UNIT_COLS = ("name", "main_file", "module", "target", "provider", "mtime_ns")
+UNIT_COLS = ("name", "main_file", "module", "target", "provider", "mtime_ns", "size_bytes")
 UNIT_INSERT = (
     "INSERT OR REPLACE INTO units("
     + ",".join(UNIT_COLS)
     + ") VALUES (" + ",".join(["?"] * len(UNIT_COLS)) + ")"
 )
 
+UNIT_FILES_COLS = ("unit_name", "file")
+UNIT_FILES_INSERT = (
+    "INSERT OR IGNORE INTO unit_files("
+    + ",".join(UNIT_FILES_COLS)
+    + ") VALUES (" + ",".join(["?"] * len(UNIT_FILES_COLS)) + ")"
+)
+
 
 def _ingest(conn: sqlite3.Connection, records: Iterable[dict[str, Any]]) -> DumpStats:
     cursor = conn.cursor()
+
+    # The helper restarts occurrence IDs at 1 on every invocation. To allow
+    # incremental ingests to reuse the same SQLite (which retains old occurrences),
+    # we offset the helper's IDs by the current MAX(id) so collisions never happen.
+    cursor.execute("SELECT COALESCE(MAX(id), 0) FROM occurrences")
+    id_offset = int(cursor.fetchone()[0] or 0)
+
     cursor.execute("BEGIN")
 
     symbol_batch: list[tuple] = []
     occurrence_batch: list[tuple] = []
     relation_batch: list[tuple] = []
     unit_batch: list[tuple] = []
+    unit_files_batch: list[tuple] = []
 
-    counts = {"symbol": 0, "occurrence": 0, "relation": 0, "unit": 0}
+    counts = {"symbol": 0, "occurrence": 0, "relation": 0, "unit": 0, "file_unit": 0}
+
+    def flush(batch: list[tuple], stmt: str) -> None:
+        if batch:
+            cursor.executemany(stmt, batch)
+            batch.clear()
 
     for record in records:
         record_type = record.get("type")
@@ -136,37 +156,35 @@ def _ingest(conn: sqlite3.Connection, records: Iterable[dict[str, Any]]) -> Dump
             symbol_batch.append(_symbol_row(record))
             counts["symbol"] += 1
             if len(symbol_batch) >= BATCH_SIZE:
-                cursor.executemany(SYMBOL_INSERT, symbol_batch)
-                symbol_batch.clear()
+                flush(symbol_batch, SYMBOL_INSERT)
         elif record_type == "occurrence":
-            occurrence_batch.append(_occurrence_row(record))
+            occurrence_batch.append(_occurrence_row(record, id_offset=id_offset))
             counts["occurrence"] += 1
             if len(occurrence_batch) >= BATCH_SIZE:
-                cursor.executemany(OCCURRENCE_INSERT, occurrence_batch)
-                occurrence_batch.clear()
+                flush(occurrence_batch, OCCURRENCE_INSERT)
         elif record_type == "relation":
-            relation_batch.append(_relation_row(record))
+            relation_batch.append(_relation_row(record, id_offset=id_offset))
             counts["relation"] += 1
             if len(relation_batch) >= BATCH_SIZE:
-                cursor.executemany(RELATION_INSERT, relation_batch)
-                relation_batch.clear()
+                flush(relation_batch, RELATION_INSERT)
         elif record_type == "unit":
             unit_batch.append(_unit_row(record))
             counts["unit"] += 1
             if len(unit_batch) >= BATCH_SIZE:
-                cursor.executemany(UNIT_INSERT, unit_batch)
-                unit_batch.clear()
+                flush(unit_batch, UNIT_INSERT)
+        elif record_type == "file_unit":
+            unit_files_batch.append(_unit_files_row(record))
+            counts["file_unit"] += 1
+            if len(unit_files_batch) >= BATCH_SIZE:
+                flush(unit_files_batch, UNIT_FILES_INSERT)
         else:
             continue
 
-    if symbol_batch:
-        cursor.executemany(SYMBOL_INSERT, symbol_batch)
-    if occurrence_batch:
-        cursor.executemany(OCCURRENCE_INSERT, occurrence_batch)
-    if relation_batch:
-        cursor.executemany(RELATION_INSERT, relation_batch)
-    if unit_batch:
-        cursor.executemany(UNIT_INSERT, unit_batch)
+    flush(symbol_batch, SYMBOL_INSERT)
+    flush(occurrence_batch, OCCURRENCE_INSERT)
+    flush(relation_batch, RELATION_INSERT)
+    flush(unit_batch, UNIT_INSERT)
+    flush(unit_files_batch, UNIT_FILES_INSERT)
 
     conn.commit()
     return DumpStats(
@@ -194,9 +212,9 @@ def _symbol_row(record: dict[str, Any]) -> tuple:
     )
 
 
-def _occurrence_row(record: dict[str, Any]) -> tuple:
+def _occurrence_row(record: dict[str, Any], *, id_offset: int = 0) -> tuple:
     return (
-        record["id"],
+        int(record["id"]) + id_offset,
         record["symbol_usr"],
         record["file"],
         record["line"],
@@ -207,9 +225,9 @@ def _occurrence_row(record: dict[str, Any]) -> tuple:
     )
 
 
-def _relation_row(record: dict[str, Any]) -> tuple:
+def _relation_row(record: dict[str, Any], *, id_offset: int = 0) -> tuple:
     return (
-        record["occurrence_id"],
+        int(record["occurrence_id"]) + id_offset,
         record["related_usr"],
         record.get("related_name"),
         record.get("kind", "other"),
@@ -232,4 +250,12 @@ def _unit_row(record: dict[str, Any]) -> tuple:
         record.get("target"),
         record.get("provider"),
         int(record.get("mtime_ns", 0)),
+        int(record.get("size_bytes", 0)),
+    )
+
+
+def _unit_files_row(record: dict[str, Any]) -> tuple:
+    return (
+        record["unit_name"],
+        record["file"],
     )

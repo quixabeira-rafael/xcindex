@@ -154,15 +154,28 @@ The agent can then trigger a rebuild before relying on the result.
 
 ## Performance
 
-| Scenario           | Latency        |
-|--------------------|----------------|
-| Cache hit          | < 50ms         |
-| Cache miss (small project) | ~1–5s    |
-| Cache miss (large project) | ~10–30s  |
-| `reach` warm       | < 200ms (typical) |
+| Scenario | Latency (small project) | Latency (large project, ~340k symbols) |
+|---|---|---|
+| First-ever query (cold bootstrap) | ~1–5s | ~2–3 min |
+| Warm cache hit (no IndexStore changes) | < 50ms | < 500ms |
+| After Xcode incremental rebuild of N files | ~1s + dump-files | ~5–15s |
+| After adding a brand-new source file | full re-bootstrap | full re-bootstrap |
+| `reach` warm | < 200ms | < 200ms |
 
-The cache is content-addressed by the IndexStore unit list + Swift version +
-helper schema version, so concurrent builds and worktrees coexist cleanly.
+The cache lives at `~/.cache/xcindex/<project-fingerprint>/index.sqlite` and is
+**mutable, atomically updated in place**. xcindex tracks each unit's `(size,
+mtime)` in the cache; on every query it reads the current `Index.noindex/v5/units/`
+listing in milliseconds and computes a delta:
+
+- **No changes** → cache hit, query directly.
+- **Modified units only** → ask the helper for the affected source files, replace
+  their rows in SQLite. Symbols defined elsewhere are untouched.
+- **Removed units** → drop their rows.
+- **Added units (new source files)** → fall back to a full re-bootstrap.
+
+Pre-v2 caches (multiple `<hash>.sqlite` files) are preserved as
+`legacy_<hash>.sqlite` snapshots; up to three of them are kept around for
+forensics, then GC'd.
 
 ## Limitations
 
@@ -184,7 +197,7 @@ xcindex (Python CLI)
   │       └─ IndexStoreDB (Apple)
   │              └─ libIndexStore.dylib (in Xcode toolchain)
   │
-  └─ SQLite cache (content-addressed by index hash)
+  └─ SQLite cache (~/.cache/xcindex/<project>/index.sqlite, updated in place)
 ```
 
 Source of truth is always the IndexStore. The SQLite cache is materialized

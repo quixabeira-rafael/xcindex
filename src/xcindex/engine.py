@@ -13,6 +13,7 @@ from xcindex import discovery
 from xcindex import dumper
 from xcindex import helper as helper_module
 from xcindex import query as query_module
+from xcindex import schema as schema_module
 
 
 @dataclass(frozen=True)
@@ -92,17 +93,50 @@ def open_context(
     helper_binary = helper_module.ensure_helper(allow_build=allow_build)
     helper_info = helper_module.get_version(helper_binary)
 
+    cache_module.ensure_cache_dir(project.path)
+    sqlite_path = cache_module.canonical_sqlite_path(project.path)
+
     index_hash = cache_module.compute_index_hash(
         index_store,
         swift_version=helper_info.swift_version,
         helper_version=helper_info.helper_version,
     )
-    sqlite_path = cache_module.sqlite_path_for(project.path, index_hash)
-    cache_module.ensure_cache_dir(project.path)
 
-    if not sqlite_path.exists():
-        with cache_module.acquire_lock(project.path):
-            if not sqlite_path.exists():
+    with cache_module.acquire_lock(project.path):
+        # Migrate any pre-v2 caches before deciding bootstrap vs reuse.
+        renamed = cache_module.migrate_v1_caches(project.path)
+        if renamed:
+            sys.stderr.write(
+                f"xcindex: schema upgraded to v{schema_module.SCHEMA_VERSION}; "
+                f"preserved {renamed} legacy snapshot(s); see `xcindex cache list`.\n"
+            )
+
+        from xcindex import incremental as incremental_module
+
+        needs_bootstrap = not sqlite_path.exists() or _schema_outdated(sqlite_path)
+        if needs_bootstrap:
+            if sqlite_path.exists():
+                sqlite_path.unlink()
+            _materialize(
+                project=project,
+                index_store=index_store,
+                sqlite_path=sqlite_path,
+                index_hash=index_hash,
+                helper_info=helper_info,
+                helper_binary=helper_binary,
+                include_system=getattr(args, "include_system", False),
+            )
+            cache_module.gc_caches(project.path)
+            cache_module.write_meta(project.path, latest_hash=index_hash)
+        else:
+            delta = incremental_module.compute_unit_delta(sqlite_path, index_store)
+            if delta.needs_full_redump:
+                # New units (added source files) — fall back to full re-dump.
+                sys.stderr.write(
+                    f"xcindex: {len(delta.added)} new unit(s) detected; "
+                    "running full re-dump (incremental cannot infer their files yet).\n"
+                )
+                sqlite_path.unlink()
                 _materialize(
                     project=project,
                     index_store=index_store,
@@ -114,6 +148,22 @@ def open_context(
                 )
                 cache_module.gc_caches(project.path)
                 cache_module.write_meta(project.path, latest_hash=index_hash)
+            elif not delta.is_empty:
+                stats = incremental_module.apply_incremental_update(
+                    sqlite_path,
+                    delta,
+                    index_store,
+                    helper_binary,
+                    include_system=getattr(args, "include_system", False),
+                )
+                sys.stderr.write(
+                    f"xcindex: incremental update — "
+                    f"modified {len(delta.modified)}, removed {len(delta.removed)} unit(s); "
+                    f"+{stats.symbols} symbols, +{stats.occurrences} occurrences, "
+                    f"+{stats.relations} relations.\n"
+                )
+                cache_module.write_meta(project.path, latest_hash=index_hash)
+            # else: cache hit, no work needed
 
     warnings: list[str] = []
     is_stale = False
@@ -143,6 +193,21 @@ def open_context(
 
 
 _SOURCE_EXTENSIONS = (".swift", ".m", ".mm", ".c", ".cc", ".cpp", ".h", ".hpp")
+
+
+def _schema_outdated(sqlite_path: Path) -> bool:
+    """Return True if the cache at sqlite_path was written with a stale schema."""
+    try:
+        conn = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
+    except sqlite3.OperationalError:
+        return True
+    try:
+        version = schema_module.read_schema_version(conn)
+    finally:
+        conn.close()
+    if version is None:
+        return True
+    return version != schema_module.SCHEMA_VERSION
 
 
 def _detect_staleness(project: discovery.ProjectInfo, index_store: Path) -> str | None:
@@ -214,6 +279,14 @@ def _materialize(
             swift_version=helper_info.swift_version,
             helper_version=helper_info.helper_version,
         )
+    # Populate the unit snapshot table so future invocations can detect deltas.
+    conn = sqlite3.connect(str(sqlite_path))
+    try:
+        from xcindex import incremental
+        incremental.refresh_units_snapshot(conn, index_store)
+    finally:
+        conn.close()
+
     sys.stderr.write(
         f"{stats.symbols} symbols, {stats.occurrences} occurrences, "
         f"{stats.relations} relations.\n"

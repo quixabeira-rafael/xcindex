@@ -1,14 +1,14 @@
 import Foundation
 import IndexStoreDB
 
-let HELPER_VERSION = "0.1.0"
-let SCHEMA_VERSION = 1
+let HELPER_VERSION = "0.2.0"
+let SCHEMA_VERSION = 2
 
 // MARK: - Entry point
 
 let args = Array(CommandLine.arguments.dropFirst())
 guard let command = args.first else {
-    writeStderr("usage: xcindex-helper {version|dump --index-store PATH}")
+    writeStderr("usage: xcindex-helper {version|dump|dump-files} --index-store PATH [...]")
     exit(1)
 }
 
@@ -17,6 +17,8 @@ case "version":
     runVersion()
 case "dump":
     runDump(Array(args.dropFirst()))
+case "dump-files":
+    runDumpFiles(Array(args.dropFirst()))
 default:
     writeStderrJSON(["error": "usage", "detail": "unknown command: \(command)"])
     exit(1)
@@ -116,19 +118,21 @@ func dumpIndexStore(at path: String, includeSystem: Bool) throws {
         }
     }
 
-    var emittedCount = (symbols: 0, occurrences: 0, relations: 0)
+    var emittedCount = (symbols: 0, occurrences: 0, relations: 0, fileUnits: 0)
     for (symbol, location) in canonicalSymbols {
         emitSymbol(symbol, location: location)
         emittedCount.symbols += 1
     }
 
     var occurrenceID = 0
+    var seenFiles = Set<String>()
     for (symbol, _) in canonicalSymbols {
         let _ = db.forEachSymbolOccurrence(byUSR: symbol.usr, roles: .all) { occ in
             if !includeSystem && occ.location.isSystem {
                 return true
             }
             occurrenceID += 1
+            seenFiles.insert(occ.location.path)
             let containerUSR = extractContainerUSR(from: occ)
             emitOccurrence(occ, id: occurrenceID, containerUSR: containerUSR)
             emittedCount.occurrences += 1
@@ -140,11 +144,132 @@ func dumpIndexStore(at path: String, includeSystem: Bool) throws {
         }
     }
 
+    // file_unit map: needed for incremental update bookkeeping in v2 schema.
+    // Emitted at the end so the consumer can flush per-file batches sequentially.
+    for file in seenFiles.sorted() {
+        let _ = db.forEachUnitNameContainingFile(path: file) { unitName in
+            emitFileUnit(file: file, unitName: unitName)
+            emittedCount.fileUnits += 1
+            return true
+        }
+    }
+
     writeStderrJSON([
         "info": "dump_complete",
         "symbols": emittedCount.symbols,
         "occurrences": emittedCount.occurrences,
         "relations": emittedCount.relations,
+        "file_units": emittedCount.fileUnits,
+    ])
+}
+
+// MARK: - dump-files
+
+func runDumpFiles(_ args: [String]) {
+    var indexStorePath: String? = nil
+    var files: [String] = []
+    var includeSystem = false
+    var i = 0
+    while i < args.count {
+        let arg = args[i]
+        switch arg {
+        case "--index-store":
+            i += 1
+            guard i < args.count else { exitArgError("--index-store requires a value") }
+            indexStorePath = args[i]
+        case "--file":
+            i += 1
+            guard i < args.count else { exitArgError("--file requires a value") }
+            files.append(args[i])
+        case "--include-system":
+            includeSystem = true
+        default:
+            exitArgError("unknown argument: \(arg)")
+        }
+        i += 1
+    }
+    guard let path = indexStorePath else {
+        exitArgError("--index-store PATH is required")
+    }
+    if files.isEmpty {
+        exitArgError("at least one --file PATH is required")
+    }
+
+    do {
+        try dumpFiles(at: path, files: files, includeSystem: includeSystem)
+    } catch {
+        writeStderrJSON([
+            "error": "dump_failed",
+            "detail": "\(error)",
+        ])
+        exit(2)
+    }
+}
+
+func dumpFiles(at path: String, files: [String], includeSystem: Bool) throws {
+    let libPath = try resolveIndexStoreLibrary()
+    let library = try IndexStoreLibrary(dylibPath: libPath)
+
+    let dbDir = NSTemporaryDirectory() + "xcindex-helper-" + UUID().uuidString
+    try FileManager.default.createDirectory(
+        atPath: dbDir,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(atPath: dbDir) }
+
+    let db = try IndexStoreDB(
+        storePath: path,
+        databasePath: dbDir,
+        library: library,
+        waitUntilDoneInitializing: true,
+        listenToUnitEvents: false
+    )
+
+    db.pollForUnitChangesAndWait()
+
+    var occurrenceID = 0
+    var emittedSymbols = Set<String>()
+    var emittedCount = (symbols: 0, occurrences: 0, relations: 0, fileUnits: 0)
+
+    for file in files {
+        let occs = db.symbolOccurrences(inFilePath: file)
+        for occ in occs {
+            if !includeSystem && occ.location.isSystem {
+                continue
+            }
+            // For symbols whose definition site is in this file, emit the symbol
+            // record so v2 cache stays consistent with the DELETE-by-file step.
+            if occ.roles.contains(.definition) && !emittedSymbols.contains(occ.symbol.usr) {
+                emittedSymbols.insert(occ.symbol.usr)
+                emitSymbol(occ.symbol, location: occ.location)
+                emittedCount.symbols += 1
+            }
+            occurrenceID += 1
+            let containerUSR = extractContainerUSR(from: occ)
+            emitOccurrence(occ, id: occurrenceID, containerUSR: containerUSR)
+            emittedCount.occurrences += 1
+            for relation in occ.relations {
+                emitRelation(occurrenceID: occurrenceID, relation: relation)
+                emittedCount.relations += 1
+            }
+        }
+    }
+
+    for file in files {
+        let _ = db.forEachUnitNameContainingFile(path: file) { unitName in
+            emitFileUnit(file: file, unitName: unitName)
+            emittedCount.fileUnits += 1
+            return true
+        }
+    }
+
+    writeStderrJSON([
+        "info": "dump_files_complete",
+        "files": files.count,
+        "symbols": emittedCount.symbols,
+        "occurrences": emittedCount.occurrences,
+        "relations": emittedCount.relations,
+        "file_units": emittedCount.fileUnits,
     ])
 }
 
@@ -177,6 +302,15 @@ func emitOccurrence(_ occ: SymbolOccurrence, id: Int, containerUSR: String?) {
         "column": occ.location.utf8Column,
         "roles": NSNumber(value: occ.roles.rawValue),
         "container_usr": (containerUSR as Any?) ?? NSNull(),
+    ]
+    writeStdoutJSON(payload)
+}
+
+func emitFileUnit(file: String, unitName: String) {
+    let payload: [String: Any] = [
+        "type": "file_unit",
+        "file": file,
+        "unit_name": unitName,
     ]
     writeStdoutJSON(payload)
 }

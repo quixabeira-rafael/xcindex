@@ -14,7 +14,9 @@ from typing import Iterator
 CACHE_ROOT = Path.home() / ".cache" / "xcindex"
 META_FILENAME = "meta.json"
 LOCK_FILENAME = ".dump.lock"
-KEEP_LAST_N_HASHES = 3
+LIVE_SQLITE_NAME = "index.sqlite"
+LEGACY_PREFIX = "legacy_"
+KEEP_LAST_N_LEGACY = 3
 
 
 @dataclass(frozen=True)
@@ -25,6 +27,7 @@ class CacheEntry:
     sqlite_path: Path
     size_bytes: int
     mtime_ns: int
+    role: str  # "live" | "legacy"
 
 
 def project_fingerprint(project_path: Path) -> str:
@@ -52,11 +55,47 @@ def ensure_cache_dir(project_path: Path) -> Path:
 
 
 def sqlite_path_for(project_path: Path, index_hash: str) -> Path:
+    """Path to a content-addressed snapshot file (legacy / v1 compatible)."""
     return project_cache_dir(project_path) / f"{index_hash}.sqlite"
 
 
+def canonical_sqlite_path(project_path: Path) -> Path:
+    """Path to the live, mutable cache (v2)."""
+    return project_cache_dir(project_path) / LIVE_SQLITE_NAME
+
+
+def legacy_sqlite_path(project_path: Path, index_hash: str) -> Path:
+    return project_cache_dir(project_path) / f"{LEGACY_PREFIX}{index_hash}.sqlite"
+
+
+def migrate_v1_caches(project_path: Path) -> int:
+    """Rename any pre-existing `<hash>.sqlite` (v1 layout) to `legacy_<hash>.sqlite`.
+
+    Returns the number of files renamed. Idempotent: if no v1 caches exist, no-op.
+    Files already named `legacy_*` are left as-is. The live `index.sqlite` is
+    excluded from migration.
+    """
+    directory = project_cache_dir(project_path)
+    if not directory.exists():
+        return 0
+    renamed = 0
+    for entry in directory.glob("*.sqlite"):
+        name = entry.name
+        if name == LIVE_SQLITE_NAME or name.startswith(LEGACY_PREFIX):
+            continue
+        target = entry.with_name(f"{LEGACY_PREFIX}{name}")
+        with contextlib.suppress(FileNotFoundError):
+            entry.rename(target)
+            renamed += 1
+    return renamed
+
+
 def list_caches(project_path: Path | None = None) -> list[CacheEntry]:
-    """Return all cached SQLite files. If project_path is None, list across all projects."""
+    """Return all cached SQLite files. If project_path is None, list across all projects.
+
+    Entries are tagged with `role`: "live" for the active `index.sqlite`,
+    "legacy" for preserved v1 snapshots.
+    """
     if project_path is not None:
         directories = [project_cache_dir(project_path)]
     else:
@@ -76,14 +115,26 @@ def list_caches(project_path: Path | None = None) -> list[CacheEntry]:
                 stat = sqlite_file.stat()
             except FileNotFoundError:
                 continue
+            name = sqlite_file.name
+            if name == LIVE_SQLITE_NAME:
+                role = "live"
+                index_hash = "live"
+            elif name.startswith(LEGACY_PREFIX):
+                role = "legacy"
+                index_hash = sqlite_file.stem[len(LEGACY_PREFIX):]
+            else:
+                # Pre-migration v1 cache that hasn't been renamed yet.
+                role = "legacy"
+                index_hash = sqlite_file.stem
             entries.append(
                 CacheEntry(
                     project_fingerprint=directory.name,
                     project_path=proj_path,
-                    index_hash=sqlite_file.stem,
+                    index_hash=index_hash,
                     sqlite_path=sqlite_file,
                     size_bytes=stat.st_size,
                     mtime_ns=stat.st_mtime_ns,
+                    role=role,
                 )
             )
     return entries
@@ -240,20 +291,22 @@ def staged_write(target: Path) -> Iterator[Path]:
 
 # --- Garbage collection -----------------------------------------------------
 
-def gc_caches(project_path: Path, keep_last_n: int = KEEP_LAST_N_HASHES) -> int:
-    """Keep only the `keep_last_n` most recently modified SQLite files for a project.
+def gc_caches(project_path: Path, keep_last_n_legacy: int = KEEP_LAST_N_LEGACY) -> int:
+    """Trim legacy snapshots to the `keep_last_n_legacy` most-recent.
 
+    The live `index.sqlite` is never collected. Only `legacy_*.sqlite` (and any
+    un-migrated `<hash>.sqlite` from older v1 layouts) are subject to GC.
     Returns the number of files removed.
     """
     directory = project_cache_dir(project_path)
     if not directory.exists():
         return 0
-    sqlite_files = sorted(
-        directory.glob("*.sqlite"),
-        key=lambda p: p.stat().st_mtime_ns,
-        reverse=True,
-    )
-    to_remove = sqlite_files[keep_last_n:]
+    legacy = [
+        p for p in directory.glob("*.sqlite")
+        if p.name != LIVE_SQLITE_NAME
+    ]
+    legacy.sort(key=lambda p: p.stat().st_mtime_ns, reverse=True)
+    to_remove = legacy[keep_last_n_legacy:]
     removed = 0
     for sqlite_file in to_remove:
         with contextlib.suppress(FileNotFoundError):

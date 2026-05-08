@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 CREATE_STATEMENTS = (
     """
@@ -48,7 +48,15 @@ CREATE_STATEMENTS = (
       module     TEXT,
       target     TEXT,
       provider   TEXT,
-      mtime_ns   INTEGER NOT NULL DEFAULT 0
+      mtime_ns   INTEGER NOT NULL DEFAULT 0,
+      size_bytes INTEGER NOT NULL DEFAULT 0
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS unit_files (
+      unit_name TEXT NOT NULL,
+      file      TEXT NOT NULL,
+      PRIMARY KEY (unit_name, file)
     );
     """,
     """
@@ -73,9 +81,29 @@ INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS idx_occ_file_line    ON occurrences(file, line, column);",
     "CREATE INDEX IF NOT EXISTS idx_occ_container    ON occurrences(container_usr);",
     "CREATE INDEX IF NOT EXISTS idx_occ_unit         ON occurrences(unit_name);",
+    "CREATE INDEX IF NOT EXISTS idx_occ_file         ON occurrences(file);",
     "CREATE INDEX IF NOT EXISTS idx_rel_related_kind ON relations(related_usr, kind);",
     "CREATE INDEX IF NOT EXISTS idx_rel_occ          ON relations(occurrence_id);",
+    "CREATE INDEX IF NOT EXISTS idx_unit_files_file  ON unit_files(file);",
+    "CREATE INDEX IF NOT EXISTS idx_unit_files_unit  ON unit_files(unit_name);",
+    "CREATE INDEX IF NOT EXISTS idx_sym_file         ON symbols(file);",
 )
+
+
+def read_schema_version(conn: sqlite3.Connection) -> int | None:
+    """Return the schema_version recorded in meta, or None if not present/legible."""
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM meta WHERE key = 'schema_version'")
+        row = cursor.fetchone()
+    except sqlite3.DatabaseError:
+        return None
+    if row is None:
+        return None
+    try:
+        return int(row[0])
+    except (TypeError, ValueError):
+        return None
 
 
 def apply_schema(conn: sqlite3.Connection) -> None:
