@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import sys
 from typing import Any, IO, Iterable
 
@@ -225,6 +226,11 @@ def _render_agent(projected: dict[str, Any]) -> str:
         else:
             parts.append(_agent_items_block(items))
 
+    if kind == "file" and items:
+        hints = _agent_file_hints(anchor, items)
+        if hints:
+            parts.append(hints)
+
     if truncated:
         parts.append("_truncated: results were limited; refine query or raise --limit_")
 
@@ -233,6 +239,106 @@ def _render_agent(projected: dict[str, Any]) -> str:
         parts.extend(f"  - {w}" for w in warnings)
 
     return "\n\n".join(p for p in parts if p)
+
+
+_HINT_TYPE_KINDS = {"class", "struct", "enum", "protocol"}
+_HINT_INHERITABLE_KINDS = {"class", "protocol"}
+_HINT_EXTENDABLE_KINDS = {"class", "struct", "enum", "protocol"}
+_HINT_CALLABLE_KINDS = {
+    "instance-method", "class-method", "static-method",
+    "function", "constructor", "destructor", "conversion-function",
+}
+_HINT_OVERRIDABLE_KINDS = _HINT_CALLABLE_KINDS | {
+    "instance-property", "class-property", "static-property",
+}
+_HINT_PROPERTY_KINDS = {
+    "instance-property", "class-property", "static-property",
+    "field", "variable",
+}
+
+
+def _agent_file_hints(anchor: dict[str, Any], items: list[dict[str, Any]]) -> str:
+    """Suggest copy-paste commands matched to the kinds present in the file.
+
+    Each command appears at most once, targeted at the most representative item
+    for its kind constraint (preferring an item whose name matches the file
+    stem). If a kind is absent, its kind-specific commands are skipped.
+    """
+    file = (anchor or {}).get("file") or ""
+    stem = ""
+    if file:
+        base = file.rsplit("/", 1)[-1]
+        stem = base.rsplit(".", 1)[0] if "." in base else base
+
+    def pick(kinds: set[str]) -> dict[str, Any] | None:
+        candidates = [it for it in items if it.get("kind") in kinds and it.get("usr")]
+        if not candidates:
+            return None
+        if stem:
+            stem_match = next((it for it in candidates if it.get("name") == stem), None)
+            if stem_match is not None:
+                return stem_match
+        return candidates[0]
+
+    primary = pick(_HINT_TYPE_KINDS) or pick(_HINT_CALLABLE_KINDS) or pick(_HINT_PROPERTY_KINDS)
+    if primary is None:
+        primary = next((it for it in items if it.get("usr")), None)
+    if primary is None:
+        return ""
+
+    inheritable = pick(_HINT_INHERITABLE_KINDS)
+    extendable = pick(_HINT_EXTENDABLE_KINDS)
+    type_target = pick(_HINT_TYPE_KINDS)
+    callable_target = pick(_HINT_CALLABLE_KINDS)
+    overridable_target = pick(_HINT_OVERRIDABLE_KINDS)
+    property_target = pick(_HINT_PROPERTY_KINDS)
+
+    primary_name = primary.get("name") or "(unnamed)"
+    primary_usr = shlex.quote(primary["usr"])
+    suggestions: list[tuple[str, str]] = [
+        (f"inspect {primary_name}", f"xcindex symbol {primary_usr}"),
+        ("references",               f"xcindex occurrences {primary_usr}"),
+        ("blast radius",             f"xcindex reach {primary_usr} --up"),
+    ]
+
+    if inheritable is not None:
+        usr = shlex.quote(inheritable["usr"])
+        suffix = "" if inheritable is primary else f" of {inheritable.get('name')}"
+        suggestions.append((f"subclasses/conformers{suffix}",
+                            f"xcindex relations {usr} --kind baseOf --direction in"))
+    if extendable is not None:
+        usr = shlex.quote(extendable["usr"])
+        suffix = "" if extendable is primary else f" of {extendable.get('name')}"
+        suggestions.append((f"extensions{suffix}",
+                            f"xcindex relations {usr} --kind extendedBy --direction in"))
+    if type_target is not None:
+        usr = shlex.quote(type_target["usr"])
+        suffix = "" if type_target is primary else f" of {type_target.get('name')}"
+        suggestions.append((f"members{suffix}",
+                            f"xcindex relations {usr} --kind containedBy --direction in"))
+    if callable_target is not None:
+        usr = shlex.quote(callable_target["usr"])
+        suffix = "" if callable_target is primary else f" of {callable_target.get('name')}"
+        suggestions.append((f"callers{suffix}",
+                            f"xcindex occurrences {usr} --role call"))
+    if overridable_target is not None:
+        usr = shlex.quote(overridable_target["usr"])
+        suffix = "" if overridable_target is primary else f" of {overridable_target.get('name')}"
+        suggestions.append((f"override chain{suffix}",
+                            f"xcindex relations {usr} --kind overrideOf --direction in"))
+    if property_target is not None:
+        usr = shlex.quote(property_target["usr"])
+        prop_suffix = "" if property_target is primary else f" of {property_target.get('name')}"
+        suggestions.append((f"reads{prop_suffix}",
+                            f"xcindex occurrences {usr} --role read"))
+        suggestions.append((f"writes{prop_suffix}",
+                            f"xcindex occurrences {usr} --role write"))
+
+    label_width = max(len(label) for label, _ in suggestions)
+    lines = ["**next steps**"]
+    for label, command in suggestions:
+        lines.append(f"  {(label + ':').ljust(label_width + 2)} {command}")
+    return "\n".join(lines)
 
 
 def _agent_headline(kind: Any, anchor: dict[str, Any], summary: dict[str, Any]) -> str:

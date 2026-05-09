@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import shlex
 
 from xcindex import engine
 from xcindex import query as query_module
@@ -49,7 +50,7 @@ def cmd_file(args: argparse.Namespace) -> int:
                     json_mode=False, exit_code=EXIT_INVALID_STATE,
                 )
             if len(matches) > 1:
-                listing = "\n".join(f"  xcindex {m}" for m in matches)
+                listing = "\n".join(f"  xcindex {shlex.quote(m)}" for m in matches)
                 return emit_error(
                     "ambiguous_file",
                     f"multiple files match {args.file!r}; pick one:\n{listing}",

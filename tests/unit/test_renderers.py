@@ -88,3 +88,102 @@ def test_unknown_format_raises():
     projected = project(_canonical(), "summary")
     with pytest.raises(ValueError):
         render(projected, "yaml")
+
+
+def _file_canonical(items, file="/abs/path/User.swift"):
+    return {
+        "kind": "file",
+        "anchor": {"file": file},
+        "summary": {"found": True, "count": len(items)},
+        "items": items,
+        "truncated": False,
+        "warnings": [],
+    }
+
+
+def test_agent_file_table_columns_are_kind_name_usr():
+    canonical = _file_canonical([
+        {"kind": "class", "name": "User", "usr": "s:U", "file": "/abs/path/User.swift"},
+    ])
+    text = render(project(canonical, "detailed"), "agent")
+    assert "kind" in text and "name" in text and "usr" in text
+    assert "class" in text and "User" in text and "s:U" in text
+
+
+def test_agent_file_hints_class_includes_subclasses_and_extensions():
+    canonical = _file_canonical([
+        {"kind": "class", "name": "User", "usr": "s:U", "file": "/abs/path/User.swift"},
+    ])
+    text = render(project(canonical, "detailed"), "agent")
+    assert "**next steps**" in text
+    assert "subclasses/conformers:" in text
+    assert "extensions:" in text
+    assert "members:" in text
+    assert "callers" not in text
+    assert "reads" not in text
+
+
+def test_agent_file_hints_struct_omits_subclasses():
+    canonical = _file_canonical([
+        {"kind": "struct", "name": "Money", "usr": "s:M", "file": "/abs/path/Money.swift"},
+    ], file="/abs/path/Money.swift")
+    text = render(project(canonical, "detailed"), "agent")
+    assert "subclasses/conformers" not in text
+    assert "extensions:" in text
+
+
+def test_agent_file_hints_target_matches_file_stem():
+    canonical = _file_canonical([
+        {"kind": "enum", "name": "CodingKeys", "usr": "s:CK", "file": "/abs/path/User.swift"},
+        {"kind": "class", "name": "User", "usr": "s:U", "file": "/abs/path/User.swift"},
+    ])
+    text = render(project(canonical, "detailed"), "agent")
+    assert "inspect User:" in text
+    assert "xcindex symbol s:U\n" in text + "\n"
+
+
+def test_agent_file_hints_with_method_and_property_extends_block():
+    canonical = _file_canonical([
+        {"kind": "class", "name": "User", "usr": "s:U", "file": "/abs/path/User.swift"},
+        {"kind": "instance-method", "name": "doIt()", "usr": "s:M", "file": "/abs/path/User.swift"},
+        {"kind": "instance-property", "name": "token", "usr": "s:P", "file": "/abs/path/User.swift"},
+    ])
+    text = render(project(canonical, "detailed"), "agent")
+    assert "callers of doIt():" in text
+    assert "override chain of doIt():" in text
+    assert "reads of token:" in text
+    assert "writes of token:" in text
+
+
+def test_agent_file_hints_absent_for_non_file_kinds():
+    canonical = _canonical()
+    text = render(project(canonical, "detailed"), "agent")
+    assert "**next steps**" not in text
+
+
+def test_file_hints_absent_in_json():
+    canonical = _file_canonical([
+        {"kind": "class", "name": "User", "usr": "s:U", "file": "/abs/path/User.swift"},
+    ])
+    text = render(project(canonical, "detailed"), "json")
+    assert "next steps" not in text
+
+
+def test_file_hints_quote_objc_usr_with_parens():
+    canonical = _file_canonical([
+        {"kind": "class", "name": "AppDelegate",
+         "usr": "c:@M@WWMobile@objc(cs)AppDelegate",
+         "file": "/abs/path/AppDelegate.swift"},
+    ], file="/abs/path/AppDelegate.swift")
+    text = render(project(canonical, "detailed"), "agent")
+    assert "xcindex symbol 'c:@M@WWMobile@objc(cs)AppDelegate'" in text
+
+
+def test_file_hints_leave_swift_usr_unquoted():
+    canonical = _file_canonical([
+        {"kind": "class", "name": "User", "usr": "s:5MyApp4UserC",
+         "file": "/abs/path/User.swift"},
+    ])
+    text = render(project(canonical, "detailed"), "agent")
+    assert "xcindex symbol s:5MyApp4UserC" in text
+    assert "'s:5MyApp4UserC'" not in text
