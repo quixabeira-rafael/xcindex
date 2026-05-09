@@ -10,6 +10,7 @@ from xcindex.commands import cache as cache_commands
 from xcindex.commands import containing as containing_commands
 from xcindex.commands import doctor as doctor_commands
 from xcindex.commands import file as file_commands
+from xcindex.commands import impact as impact_commands
 from xcindex.commands import neighbors as neighbors_commands
 from xcindex.commands import occurrences as occurrences_commands
 from xcindex.commands import reach as reach_commands
@@ -41,6 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     relations_commands.register(subparsers)
     neighbors_commands.register(subparsers)
     reach_commands.register(subparsers)
+    impact_commands.register(subparsers)
     search_commands.register(subparsers)
 
     return parser

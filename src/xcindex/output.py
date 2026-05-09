@@ -97,6 +97,14 @@ def project(canonical: dict[str, Any], level: str) -> dict[str, Any]:
         return _strip_empty(out)
 
     out["summary"] = summary
+    if canonical.get("kind") == "impact":
+        out["mode"] = canonical.get("mode")
+        if level in ("locations", "detailed"):
+            out["stacks"] = canonical.get("stacks") or {"upstream": [], "downstream": []}
+            structure = canonical.get("structure")
+            if structure is not None:
+                out["structure"] = structure
+        return _strip_empty(out)
     if level == "summary":
         return _strip_empty(out)
 
@@ -203,6 +211,9 @@ def _render_compact(projected: dict[str, Any]) -> str:
 
 
 def _render_agent(projected: dict[str, Any]) -> str:
+    if projected.get("kind") == "impact":
+        return _render_impact_agent(projected)
+
     parts: list[str] = []
     kind = projected.get("kind")
     anchor = projected.get("anchor") or {}
@@ -414,6 +425,259 @@ def _format_summary_value(value: Any) -> str:
     if isinstance(value, list):
         return ", ".join(str(v) for v in value)
     return str(value)
+
+
+# --- Internal: impact renderer ---------------------------------------------------
+
+_IMPACT_HINT_KIND_MAP = {
+    "instance-property": ("read sites", "write sites", "containing type"),
+    "class-property":    ("read sites", "write sites", "containing type"),
+    "static-property":   ("read sites", "write sites", "containing type"),
+    "field":             ("read sites", "write sites"),
+    "variable":          ("read sites", "write sites"),
+    "extension":         ("members", "extended type"),
+    "typealias":         ("references",),
+    "enum-case":         ("references", "containing enum"),
+    "parameter":         ("references",),
+}
+
+
+def _render_impact_agent(projected: dict[str, Any]) -> str:
+    parts: list[str] = []
+    mode = projected.get("mode") or "hint_only"
+    anchor = projected.get("anchor") or {}
+    summary = projected.get("summary") or {}
+    stacks = projected.get("stacks") or {"upstream": [], "downstream": []}
+    structure = projected.get("structure") or None
+    warnings = projected.get("warnings") or []
+    truncated = projected.get("truncated", False)
+
+    parts.append(_impact_headline(mode, anchor, summary))
+
+    summary_block = _impact_summary_block(mode, summary)
+    if summary_block:
+        parts.append(summary_block)
+
+    if mode in ("call_stack", "usage_chain"):
+        upstream = stacks.get("upstream") or []
+        downstream = stacks.get("downstream") or []
+        if upstream:
+            parts.append(_impact_stacks_block("upstream", upstream))
+        if downstream:
+            parts.append(_impact_stacks_block("downstream", downstream))
+        if not upstream and not downstream and mode == "call_stack":
+            parts.append("_no transitive callers/callees found in indexed code._")
+
+    if structure:
+        block = _impact_structure_block(structure)
+        if block:
+            parts.append(block)
+
+    hints = _impact_hints(mode, anchor)
+    if hints:
+        parts.append(hints)
+
+    if truncated:
+        parts.append("_truncated: stacks were limited; raise --max-stacks or --depth_")
+
+    if warnings:
+        parts.append("warnings:")
+        parts.extend(f"  - {w}" for w in warnings)
+
+    return "\n\n".join(p for p in parts if p)
+
+
+def _impact_headline(mode: str, anchor: dict[str, Any], summary: dict[str, Any]) -> str:
+    name = anchor.get("name") or anchor.get("usr") or "(target)"
+    kind = anchor.get("kind")
+    module = anchor.get("module")
+    suffix_bits: list[str] = []
+    if kind:
+        suffix_bits.append(f"{kind}")
+    if module:
+        suffix_bits.append(module)
+    suffix = f" [{' / '.join(suffix_bits)}]" if suffix_bits else ""
+
+    if mode == "call_stack":
+        up = summary.get("upstream", {}) or {}
+        down = summary.get("downstream", {}) or {}
+        return (
+            f"## impact — {name}{suffix} "
+            f"({up.get('stacks', 0)} upstream, {down.get('stacks', 0)} downstream)"
+        )
+    if mode == "usage_chain":
+        up = summary.get("upstream", {}) or {}
+        sc = summary.get("structure_counts", {}) or {}
+        return (
+            f"## impact — {name}{suffix} "
+            f"(type — {up.get('transitive_count', 0)} transitive users, "
+            f"{sc.get('members', 0)} members)"
+        )
+    return f"## impact — {name}{suffix}"
+
+
+def _impact_summary_block(mode: str, summary: dict[str, Any]) -> str:
+    if mode == "hint_only":
+        reason = summary.get("reason")
+        return f"_{reason}_" if reason else ""
+
+    lines = ["**summary**"]
+    up = summary.get("upstream") or {}
+    if up:
+        lines.append(
+            f"  - upstream:   {up.get('transitive_count', 0)} transitive callers, "
+            f"{up.get('module_count', 0)} modules"
+        )
+        if up.get("by_module"):
+            lines.append(f"      by_module: {_format_summary_value(up['by_module'])}")
+        if up.get("by_depth"):
+            lines.append(f"      by_depth:  {_format_summary_value(up['by_depth'])}")
+        if up.get("by_edge_kind") and set(up["by_edge_kind"]) - {"calledBy"}:
+            lines.append(f"      by_edge:   {_format_summary_value(up['by_edge_kind'])}")
+
+    down = summary.get("downstream") or {}
+    if down and down.get("stacks"):
+        lines.append(
+            f"  - downstream: {down.get('transitive_count', 0)} transitive callees, "
+            f"{down.get('module_count', 0)} modules"
+        )
+        if down.get("by_depth"):
+            lines.append(f"      by_depth:  {_format_summary_value(down['by_depth'])}")
+
+    sc = summary.get("structure_counts") or {}
+    if sc:
+        lines.append(
+            f"  - structure:  {sc.get('members', 0)} members, "
+            f"{sc.get('subclasses', 0)} subclasses, "
+            f"{sc.get('extensions', 0)} extensions"
+        )
+
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+def _impact_stacks_block(label: str, stacks: list[list[dict[str, Any]]]) -> str:
+    blocks: list[str] = []
+    for index, stack in enumerate(stacks, start=1):
+        depth = max(0, len(stack) - 1)
+        non_default_edges = sorted({
+            f["edge_kind"] for f in stack
+            if f.get("edge_kind") and f["edge_kind"] != "calledBy"
+        })
+        edge_suffix = f" ({', '.join(non_default_edges)})" if non_default_edges else ""
+        blocks.append(f"[{label} stack {index}] depth {depth}{edge_suffix}")
+        for n, frame in enumerate(stack):
+            blocks.append("  " + _format_impact_frame(n, frame))
+    return "\n".join(blocks)
+
+
+def _format_impact_frame(index: int, frame: dict[str, Any]) -> str:
+    name = frame.get("name") or "(unnamed)"
+    file = frame.get("file")
+    line = frame.get("line")
+    module = frame.get("module")
+    is_target = bool(frame.get("is_target"))
+
+    if file and line is not None:
+        loc = f"{file}:{line}"
+    elif file:
+        loc = file
+    else:
+        loc = "(external)"
+    if module:
+        loc = f"{module}/{loc.split('/')[-1] if '/' in loc else loc}" if file else f"{module} {loc}"
+
+    target_marker = "  ← target" if is_target else ""
+    return f"#{index}  {name:<48s} {loc}{target_marker}"
+
+
+def _impact_structure_block(structure: dict[str, list[dict[str, Any]]]) -> str:
+    members = structure.get("members") or []
+    subclasses = structure.get("subclasses") or []
+    extensions = structure.get("extensions") or []
+    if not (members or subclasses or extensions):
+        return ""
+    lines = ["**structure**"]
+    if members:
+        lines.append(f"  members ({len(members)}):")
+        for row in members[:50]:
+            lines.append(
+                f"    {row.get('name'):<32s} {row.get('kind') or '?':<20s} "
+                f"{(row.get('file') or '(external)')}:{row.get('line') or '?'}"
+            )
+        if len(members) > 50:
+            lines.append(f"    ... ({len(members) - 50} more)")
+    if subclasses:
+        lines.append(f"  subclasses ({len(subclasses)}):")
+        for row in subclasses[:25]:
+            lines.append(
+                f"    {row.get('name'):<32s} {(row.get('file') or '(external)')}:{row.get('line') or '?'}"
+            )
+        if len(subclasses) > 25:
+            lines.append(f"    ... ({len(subclasses) - 25} more)")
+    if extensions:
+        lines.append(f"  extensions ({len(extensions)}):")
+        for row in extensions[:25]:
+            lines.append(
+                f"    {row.get('name'):<32s} {(row.get('file') or '(external)')}:{row.get('line') or '?'}"
+            )
+        if len(extensions) > 25:
+            lines.append(f"    ... ({len(extensions) - 25} more)")
+    return "\n".join(lines)
+
+
+def _impact_hints(mode: str, anchor: dict[str, Any]) -> str:
+    usr = anchor.get("usr")
+    if not usr:
+        return ""
+    qusr = shlex.quote(usr)
+
+    suggestions: list[tuple[str, str]] = []
+    if mode == "call_stack":
+        suggestions = [
+            ("full graph (raw)",   f"xcindex reach {qusr} --up --limit 5000"),
+            ("filter by module",   f"xcindex impact {qusr} --to-module <Module>"),
+            ("direct callers",     f"xcindex relations {qusr} --kind calledBy --direction in"),
+            ("direct callees",     f"xcindex relations {qusr} --kind calledBy --direction out"),
+        ]
+    elif mode == "usage_chain":
+        suggestions = [
+            ("drill into a member", f"xcindex impact '<MemberName>'"),
+            ("list all references", f"xcindex occurrences {qusr}"),
+            ("silent inheritors",   f"xcindex relations {qusr} --kind baseOf --direction in"),
+            ("extensions",          f"xcindex relations {qusr} --kind extendedBy --direction in"),
+        ]
+    else:
+        kind = anchor.get("kind") or ""
+        flavors = _IMPACT_HINT_KIND_MAP.get(kind, ("references", "blast radius"))
+        for flavor in flavors:
+            if flavor == "read sites":
+                suggestions.append(("read sites", f"xcindex occurrences {qusr} --role read"))
+            elif flavor == "write sites":
+                suggestions.append(("write sites", f"xcindex occurrences {qusr} --role write"))
+            elif flavor == "containing type":
+                suggestions.append(("containing type",
+                                    f"xcindex relations {qusr} --kind containedBy --direction out"))
+            elif flavor == "members":
+                suggestions.append(("members",
+                                    f"xcindex relations {qusr} --kind containedBy --direction in"))
+            elif flavor == "extended type":
+                suggestions.append(("extended type",
+                                    f"xcindex relations {qusr} --kind extendedBy --direction out"))
+            elif flavor == "containing enum":
+                suggestions.append(("containing enum",
+                                    f"xcindex relations {qusr} --kind containedBy --direction out"))
+            elif flavor == "references":
+                suggestions.append(("references", f"xcindex occurrences {qusr}"))
+            elif flavor == "blast radius":
+                suggestions.append(("blast radius", f"xcindex reach {qusr} --up"))
+
+    if not suggestions:
+        return ""
+    label_width = max(len(label) for label, _ in suggestions)
+    lines = ["**next steps**"]
+    for label, command in suggestions:
+        lines.append(f"  {(label + ':').ljust(label_width + 2)} {command}")
+    return "\n".join(lines)
 
 
 # --- Internal: shared --------------------------------------------------------------

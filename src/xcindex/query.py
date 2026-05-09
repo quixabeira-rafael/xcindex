@@ -7,6 +7,19 @@ from typing import Any
 from xcindex import schema as schema_module
 
 
+class SymbolNotFoundError(Exception):
+    """Raised when a USR or name argument cannot be resolved in the index."""
+
+
+class AmbiguousNameError(Exception):
+    """Raised when a name resolves to more than one symbol; carries candidates."""
+
+    def __init__(self, name: str, candidates: list[dict[str, Any]]) -> None:
+        super().__init__(f"name {name!r} matches {len(candidates)} symbols")
+        self.name = name
+        self.candidates = candidates
+
+
 def open_readonly(sqlite_path: Path) -> sqlite3.Connection:
     """Open a read-only SQLite connection tuned for queries."""
     if not sqlite_path.exists():
@@ -576,6 +589,220 @@ def query_search(
         "items": items,
         "truncated": truncated,
     }
+
+
+# --- Helpers for impact analysis (BFS over relations + input resolution) -----
+
+
+def resolve_input_to_usr(conn: sqlite3.Connection, input_str: str) -> dict[str, Any]:
+    """Resolve a CLI input (USR / `<file>:<line>` / name) to a single symbol.
+
+    Returns the symbol row dict (with at least `usr`, `name`, `kind`).
+    Raises:
+      - `SymbolNotFoundError` when nothing matches.
+      - `AmbiguousNameError` when a name matches more than one symbol.
+      - `ValueError` when the file:line form has a malformed line component.
+    """
+    text = input_str.strip()
+    if text.startswith(("s:", "c:")):
+        canonical = query_symbol_by_usr(conn, text)
+        if not canonical["summary"]["found"]:
+            raise SymbolNotFoundError(f"USR not found in index: {text}")
+        return canonical["items"][0]
+
+    if ":" in text:
+        head, _, tail = text.rpartition(":")
+        if head and tail.isdigit():
+            file_path = head
+            line = int(tail)
+            expanded = Path(file_path).expanduser()
+            resolved = str(expanded.resolve()) if expanded.exists() else str(expanded)
+            canonical = query_containing(conn, resolved, line)
+            if not canonical["summary"]["found"]:
+                raise SymbolNotFoundError(
+                    f"no symbol found at {resolved}:{line} (file may not be indexed)"
+                )
+            return canonical["items"][0]
+
+    canonical = query_symbol_by_name(conn, text, limit=20)
+    items = canonical["items"]
+    if not items:
+        raise SymbolNotFoundError(f"name not found in index: {text!r}")
+    if len(items) > 1:
+        raise AmbiguousNameError(text, items)
+    return items[0]
+
+
+def fetch_callers_layer(
+    conn: sqlite3.Connection,
+    frontier_usrs: list[str],
+    *,
+    kinds: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    """Return one BFS layer of upstream callers for the given frontier.
+
+    Each row carries (callee, caller, edge_kind, site_file, site_line, caller_name,
+    caller_kind, caller_module, caller_file, caller_line). Caller fields come from
+    the symbols table when known.
+    """
+    if not frontier_usrs or not kinds:
+        return []
+    frontier_placeholders = ",".join(["?"] * len(frontier_usrs))
+    kind_placeholders = ",".join(["?"] * len(kinds))
+    cursor = conn.cursor()
+    cursor.execute(
+        f"""
+        SELECT o.symbol_usr AS callee,
+               r.related_usr AS caller,
+               r.kind        AS edge_kind,
+               o.file        AS site_file,
+               o.line        AS site_line,
+               s.name        AS caller_name,
+               s.kind        AS caller_kind,
+               s.module      AS caller_module,
+               s.file        AS caller_file,
+               s.line        AS caller_line
+        FROM relations r
+        JOIN occurrences o ON o.id = r.occurrence_id
+        LEFT JOIN symbols s ON s.usr = r.related_usr
+        WHERE o.symbol_usr IN ({frontier_placeholders})
+          AND r.kind IN ({kind_placeholders})
+        """,
+        (*frontier_usrs, *kinds),
+    )
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def fetch_callees_layer(
+    conn: sqlite3.Connection,
+    frontier_usrs: list[str],
+    *,
+    kinds: tuple[str, ...] = ("calledBy",),
+) -> list[dict[str, Any]]:
+    """Return one BFS layer of downstream callees for the given frontier.
+
+    Inverts the relation direction: `r.related_usr=current` and `o.symbol_usr` is
+    the callee. Site fields come from the call-site occurrence.
+    """
+    if not frontier_usrs or not kinds:
+        return []
+    frontier_placeholders = ",".join(["?"] * len(frontier_usrs))
+    kind_placeholders = ",".join(["?"] * len(kinds))
+    cursor = conn.cursor()
+    cursor.execute(
+        f"""
+        SELECT r.related_usr AS caller,
+               o.symbol_usr  AS callee,
+               r.kind        AS edge_kind,
+               o.file        AS site_file,
+               o.line        AS site_line,
+               s.name        AS callee_name,
+               s.kind        AS callee_kind,
+               s.module      AS callee_module,
+               s.file        AS callee_file,
+               s.line        AS callee_line
+        FROM relations r
+        JOIN occurrences o ON o.id = r.occurrence_id
+        LEFT JOIN symbols s ON s.usr = o.symbol_usr
+        WHERE r.related_usr IN ({frontier_placeholders})
+          AND r.kind IN ({kind_placeholders})
+        """,
+        (*frontier_usrs, *kinds),
+    )
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def fetch_type_reference_containers(
+    conn: sqlite3.Connection,
+    type_usr: str,
+) -> list[dict[str, Any]]:
+    """Return distinct container symbols whose code references the given type.
+
+    A 'container' is the enclosing symbol (method/function) that hosts a
+    reference to the type. Used as the level-1 upstream layer for a type target.
+    """
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT DISTINCT o.container_usr AS container_usr,
+               s.name   AS container_name,
+               s.kind   AS container_kind,
+               s.module AS container_module,
+               s.file   AS container_file,
+               s.line   AS container_line,
+               MIN(o.file) AS site_file,
+               MIN(o.line) AS site_line
+        FROM occurrences o
+        LEFT JOIN symbols s ON s.usr = o.container_usr
+        WHERE o.symbol_usr = ?
+          AND o.container_usr IS NOT NULL
+          AND o.container_usr != ?
+          AND (o.roles & 4) != 0
+        GROUP BY o.container_usr
+        """,
+        (type_usr, type_usr),
+    )
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def fetch_type_structure(
+    conn: sqlite3.Connection,
+    type_usr: str,
+) -> dict[str, list[dict[str, Any]]]:
+    """Return members, subclasses/conformers, and extensions of a type.
+
+    Direction notes (matching `query_relations` semantics):
+      - members: member's occurrence carries a `childOf`/`containedBy` relation
+        pointing to the type (`r.related_usr = T`); member's USR is `o.symbol_usr`.
+      - subclasses/conformers: type's occurrence (in the subclass def file) carries
+        a `baseOf` relation pointing to the subclass (`r.related_usr` is the subclass).
+      - extensions: type's occurrence (in the extension's site) carries an
+        `extendedBy` relation; the extension's USR is `r.related_usr`.
+    """
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT DISTINCT s.usr, s.name, s.kind, s.module, s.file, s.line
+        FROM relations r
+        JOIN occurrences o ON o.id = r.occurrence_id
+        LEFT JOIN symbols s ON s.usr = o.symbol_usr
+        WHERE r.related_usr = ?
+          AND r.kind IN ('childOf', 'containedBy')
+        ORDER BY s.line, s.name
+        """,
+        (type_usr,),
+    )
+    members = [dict(row) for row in cursor.fetchall() if row["usr"]]
+
+    cursor.execute(
+        """
+        SELECT DISTINCT s.usr, s.name, s.kind, s.module, s.file, s.line
+        FROM relations r
+        JOIN occurrences o ON o.id = r.occurrence_id
+        LEFT JOIN symbols s ON s.usr = r.related_usr
+        WHERE o.symbol_usr = ?
+          AND r.kind = 'baseOf'
+        ORDER BY s.module, s.name
+        """,
+        (type_usr,),
+    )
+    subclasses = [dict(row) for row in cursor.fetchall() if row["usr"]]
+
+    cursor.execute(
+        """
+        SELECT DISTINCT s.usr, s.name, s.kind, s.module, s.file, s.line
+        FROM relations r
+        JOIN occurrences o ON o.id = r.occurrence_id
+        LEFT JOIN symbols s ON s.usr = r.related_usr
+        WHERE o.symbol_usr = ?
+          AND r.kind = 'extendedBy'
+        ORDER BY s.module, s.name
+        """,
+        (type_usr,),
+    )
+    extensions = [dict(row) for row in cursor.fetchall() if row["usr"]]
+
+    return {"members": members, "subclasses": subclasses, "extensions": extensions}
 
 
 # --- Internal helpers --------------------------------------------------------

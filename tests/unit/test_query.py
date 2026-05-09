@@ -284,3 +284,127 @@ def test_decode_roles_handles_signed_overflow():
 def test_role_bit_unknown_raises():
     with pytest.raises(ValueError):
         query_module.role_bit("nonsense")
+
+
+# --- resolve_input_to_usr ---------------------------------------------------
+
+def test_resolve_input_passthrough_swift_usr_keeps_existing(populated_conn):
+    cur = populated_conn.cursor()
+    cur.execute(
+        "INSERT INTO symbols(usr, name, kind, sub_kind, language, module, file, line, is_system, properties) "
+        "VALUES ('s:Real', 'Real', 'class', NULL, 'swift', 'Core', 'Core/Real.swift', 1, 0, 0)"
+    )
+    populated_conn.commit()
+    target = query_module.resolve_input_to_usr(populated_conn, "s:Real")
+    assert target["usr"] == "s:Real"
+    assert target["kind"] == "class"
+
+
+def test_resolve_input_passthrough_unknown_usr_raises(populated_conn):
+    with pytest.raises(query_module.SymbolNotFoundError):
+        query_module.resolve_input_to_usr(populated_conn, "s:nonexistent")
+
+
+def test_resolve_input_name_unique_match(populated_conn):
+    target = query_module.resolve_input_to_usr(populated_conn, "Caller")
+    assert target["usr"] == "caller"
+    assert target["kind"] == "class"
+
+
+def test_resolve_input_name_ambiguous_raises_with_candidates(populated_conn):
+    cur = populated_conn.cursor()
+    cur.execute(
+        "INSERT INTO symbols(usr, name, kind, sub_kind, language, module, file, line, is_system, properties) "
+        "VALUES ('caller2', 'Caller', 'class', NULL, 'swift', 'Other', 'Other/Caller.swift', 1, 0, 0)"
+    )
+    populated_conn.commit()
+    with pytest.raises(query_module.AmbiguousNameError) as exc_info:
+        query_module.resolve_input_to_usr(populated_conn, "Caller")
+    assert exc_info.value.name == "Caller"
+    assert len(exc_info.value.candidates) == 2
+
+
+def test_resolve_input_name_not_found_raises(populated_conn):
+    with pytest.raises(query_module.SymbolNotFoundError):
+        query_module.resolve_input_to_usr(populated_conn, "Nonexistent")
+
+
+def test_resolve_input_file_line_picks_containing_symbol(populated_conn):
+    target = query_module.resolve_input_to_usr(populated_conn, "Core/Foo.swift:4")
+    assert target["usr"] == "bar"
+
+
+def test_resolve_input_file_line_no_match_raises(populated_conn):
+    with pytest.raises(query_module.SymbolNotFoundError):
+        query_module.resolve_input_to_usr(populated_conn, "Nope.swift:42")
+
+
+# --- fetch_callers_layer / fetch_callees_layer ------------------------------
+
+def test_fetch_callers_layer_simple(populated_conn):
+    rows = query_module.fetch_callers_layer(populated_conn, ["bar"], kinds=("calledBy",))
+    assert len(rows) == 1
+    assert rows[0]["caller"] == "run"
+    assert rows[0]["edge_kind"] == "calledBy"
+
+
+def test_fetch_callers_layer_filters_by_kind(populated_conn):
+    rows = query_module.fetch_callers_layer(populated_conn, ["bar"], kinds=("overrideOf",))
+    assert rows == []
+
+
+def test_fetch_callers_layer_includes_site(populated_conn):
+    rows = query_module.fetch_callers_layer(populated_conn, ["bar"], kinds=("calledBy",))
+    assert rows[0]["site_file"] == "UI/Caller.swift"
+    assert rows[0]["site_line"] == 42
+
+
+def test_fetch_callers_layer_empty_frontier_returns_empty(populated_conn):
+    assert query_module.fetch_callers_layer(populated_conn, [], kinds=("calledBy",)) == []
+
+
+def test_fetch_callees_layer_inverts_direction(populated_conn):
+    rows = query_module.fetch_callees_layer(populated_conn, ["run"], kinds=("calledBy",))
+    callees = {row["callee"] for row in rows}
+    assert "bar" in callees
+
+
+# --- fetch_type_reference_containers ---------------------------------------
+
+def test_fetch_type_reference_containers_returns_distinct(populated_conn):
+    cur = populated_conn.cursor()
+    # Add a reference of Foo inside run() (container=run)
+    cur.execute(
+        "INSERT INTO occurrences(id, symbol_usr, file, line, column, roles, container_usr, unit_name) "
+        "VALUES (10, 'foo', 'UI/Caller.swift', 6, 10, 4, 'run', 'u3')"
+    )
+    populated_conn.commit()
+    rows = query_module.fetch_type_reference_containers(populated_conn, "foo")
+    containers = {row["container_usr"] for row in rows}
+    assert "run" in containers
+
+
+def test_fetch_type_reference_containers_skips_target_self(populated_conn):
+    rows = query_module.fetch_type_reference_containers(populated_conn, "foo")
+    for row in rows:
+        assert row["container_usr"] != "foo"
+
+
+# --- fetch_type_structure ---------------------------------------------------
+
+def test_fetch_type_structure_lists_members(populated_conn):
+    structure = query_module.fetch_type_structure(populated_conn, "foo")
+    member_names = {m["name"] for m in structure["members"]}
+    assert "bar()" in member_names
+    assert "qux()" in member_names
+
+
+def test_fetch_type_structure_lists_subclasses(populated_conn):
+    structure = query_module.fetch_type_structure(populated_conn, "foo")
+    sub_names = {s["name"] for s in structure["subclasses"]}
+    assert "SubFoo" in sub_names
+
+
+def test_fetch_type_structure_returns_empty_lists_for_unknown_type(populated_conn):
+    structure = query_module.fetch_type_structure(populated_conn, "nonexistent")
+    assert structure == {"members": [], "subclasses": [], "extensions": []}

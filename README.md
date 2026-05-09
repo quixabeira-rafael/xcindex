@@ -53,10 +53,12 @@ when Xcode rebuilds (different hash → fresh dump).
 | `symbol USR\|NAME` | Look up a symbol's metadata                         |
 | `at FILE:L[:C]` | List symbols/occurrences at a position                 |
 | `containing FILE:L` | Find the enclosing symbol (method/class)           |
+| `file FILE`     | List type definitions in a source file (also: `xcindex <file>`) |
 | `occurrences USR` | All occurrences of a symbol (filterable by `--role`)|
 | `relations USR` | Relations of a symbol (`--direction in\|out`, `--kind`)|
 | `neighbors USR` | 1-hop union of relations both directions               |
 | `reach USR`     | Transitive closure (`--up\|--down`, `--depth`, `--to-module`) |
+| `impact TARGET` | Bidirectional call/usage stacks for a method or type   |
 
 ## Output engine (level × format)
 

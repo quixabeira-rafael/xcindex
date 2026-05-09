@@ -58,3 +58,23 @@ def test_file_shorthand_expands_to_file_subcommand():
     short = _xcindex("ZZZ_NotARealFile_xyz.swift")
     assert foreign.returncode == short.returncode
     assert foreign.stderr.splitlines()[-1] == short.stderr.splitlines()[-1]
+
+
+def test_impact_subcommand_help_works():
+    proc = _xcindex("impact", "--help")
+    assert proc.returncode == 0
+    assert "impact" in proc.stdout.lower()
+    assert "--depth" in proc.stdout
+
+
+def test_impact_requires_target_argument():
+    proc = _xcindex("impact")
+    assert proc.returncode != 0
+
+
+def test_impact_does_not_steal_file_shorthand():
+    """`xcindex Foo.swift` continues going to file, not impact."""
+    proc = _xcindex("ZZZ_NotARealFile_xyz.swift")
+    # If shorthand stole the call to impact, error would mention 'target_not_found'
+    # via name lookup; with file dispatch we get 'file_not_indexed' or project-discovery error.
+    assert "ambiguous_name" not in proc.stderr
