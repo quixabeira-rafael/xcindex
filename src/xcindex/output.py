@@ -105,6 +105,10 @@ def project(canonical: dict[str, Any], level: str) -> dict[str, Any]:
             if structure is not None:
                 out["structure"] = structure
         return _strip_empty(out)
+    if canonical.get("kind") == "git":
+        if level in ("locations", "detailed"):
+            out["files"] = list(canonical.get("files") or [])
+        return _strip_empty(out)
     if level == "summary":
         return _strip_empty(out)
 
@@ -213,6 +217,8 @@ def _render_compact(projected: dict[str, Any]) -> str:
 def _render_agent(projected: dict[str, Any]) -> str:
     if projected.get("kind") == "impact":
         return _render_impact_agent(projected)
+    if projected.get("kind") == "git":
+        return _render_git_agent(projected)
 
     parts: list[str] = []
     kind = projected.get("kind")
@@ -425,6 +431,108 @@ def _format_summary_value(value: Any) -> str:
     if isinstance(value, list):
         return ", ".join(str(v) for v in value)
     return str(value)
+
+
+# --- Internal: git renderer ------------------------------------------------------
+
+
+def _render_git_agent(projected: dict[str, Any]) -> str:
+    parts: list[str] = []
+    anchor = projected.get("anchor") or {}
+    summary = projected.get("summary") or {}
+    files = projected.get("files") or []
+    warnings = projected.get("warnings") or []
+
+    label = anchor.get("label") or "git changes"
+    file_count = summary.get("files", 0)
+    sym_count = summary.get("modified_symbols", 0)
+    parts.append(
+        f"## git changes — {label} ({file_count} file{'s' if file_count != 1 else ''}, "
+        f"{sym_count} modified symbol{'s' if sym_count != 1 else ''})"
+    )
+
+    by_status = summary.get("by_status") or {}
+    if by_status:
+        parts.append("**summary**\n" + "  - by_status: " + _format_summary_value(by_status))
+
+    if not files:
+        parts.append("_no indexable file changes detected._")
+    else:
+        for entry in files:
+            parts.append(_git_file_block(entry))
+
+        suggestion_block = _git_suggestions_block(files)
+        if suggestion_block:
+            parts.append(suggestion_block)
+
+    if warnings:
+        parts.append("warnings:")
+        parts.extend(f"  - {w}" for w in warnings)
+
+    return "\n\n".join(p for p in parts if p)
+
+
+def _git_file_block(entry: dict[str, Any]) -> str:
+    lines: list[str] = []
+    path = entry.get("path") or "(unknown)"
+    status = entry.get("status") or "?"
+    old_path = entry.get("old_path")
+    note = entry.get("note")
+    symbols = entry.get("symbols") or []
+
+    header = f"{path}  [{status}]"
+    if old_path:
+        header += f"  (renamed from {old_path})"
+    lines.append(header)
+
+    if note:
+        lines.append(f"  ⚠ {note}")
+    if not symbols:
+        if not note:
+            lines.append("  (no enclosing symbols resolved at modified ranges)")
+        return "\n".join(lines)
+
+    name_w = min(48, max((len(s.get("name") or "") for s in symbols), default=8))
+    kind_w = min(20, max((len(s.get("kind") or "") for s in symbols), default=8))
+    for sym in symbols:
+        rng = sym.get("modified_range") or [None, None]
+        loc = f"L{rng[0]}-{rng[1]}" if rng[0] != rng[1] else f"L{rng[0]}"
+        name = (sym.get("name") or "(unnamed)").ljust(name_w)
+        kind = (sym.get("kind") or "?").ljust(kind_w)
+        usr = sym.get("usr") or "(no usr)"
+        lines.append(f"  {loc:<10s}  {name}  [{kind}]  {usr}")
+    return "\n".join(lines)
+
+
+def _git_suggestions_block(files: list[dict[str, Any]]) -> str:
+    file_cmds: list[str] = []
+    impact_cmds: list[str] = []
+    seen_paths: set[str] = set()
+    seen_usrs: set[str] = set()
+    for entry in files:
+        path = entry.get("path") or ""
+        if entry.get("status") in ("modified", "renamed", "copied", "added") and path and path not in seen_paths:
+            seen_paths.add(path)
+            file_cmds.append(f"xcindex file {shlex.quote(path)}")
+        for sym in entry.get("symbols") or []:
+            usr = sym.get("usr")
+            if not usr or usr in seen_usrs:
+                continue
+            seen_usrs.add(usr)
+            impact_cmds.append(f"xcindex impact {shlex.quote(usr)}")
+
+    if not (file_cmds or impact_cmds):
+        return ""
+    parts = ["**next steps**"]
+    if file_cmds:
+        parts.append("  list types in modified files:")
+        for cmd in file_cmds:
+            parts.append(f"    {cmd}")
+    if impact_cmds:
+        parts.append("  blast radius of each modified symbol:")
+        for cmd in impact_cmds:
+            parts.append(f"    {cmd}")
+    return "\n".join(parts)
 
 
 # --- Internal: impact renderer ---------------------------------------------------

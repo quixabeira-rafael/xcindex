@@ -137,3 +137,38 @@ def test_run_all_checks_returns_list(tmp_path: Path):
     assert len(results) >= 6
     names = {r.name for r in results}
     assert {"macOS", "Python", "xcrun", "swift", "cache", "project", "index-store"}.issubset(names)
+
+
+# --- check_git_repo ---------------------------------------------------------
+
+def test_check_git_repo_no_cli_returns_info():
+    with patch("shutil.which", return_value=None):
+        result = doctor.check_git_repo()
+    assert result.status == doctor.STATUS_INFO
+    assert "git CLI not on PATH" in result.detail
+
+
+def test_check_git_repo_outside_worktree_returns_info(tmp_path: Path):
+    result = doctor.check_git_repo(tmp_path)
+    assert result.status == doctor.STATUS_INFO
+    assert "not inside a git working tree" in result.detail
+
+
+def test_check_git_repo_inside_worktree_returns_ok(tmp_path: Path):
+    subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=tmp_path, check=True)
+    (tmp_path / "f.txt").write_text("x\n")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True)
+    result = doctor.check_git_repo(tmp_path)
+    assert result.status == doctor.STATUS_OK
+    assert "branch=main" in result.detail
+    assert "base=" in result.detail
+
+
+def test_run_all_checks_includes_git_check(tmp_path: Path):
+    (tmp_path / ".git").mkdir()
+    results = doctor.run_all_checks(tmp_path)
+    names = {r.name for r in results}
+    assert "git" in names

@@ -46,7 +46,7 @@ when Xcode rebuilds (different hash → fresh dump).
 |-----------------|--------------------------------------------------------|
 | `setup install` | Validate toolchain and build the Swift helper          |
 | `setup uninstall` | Remove helper binary and SQLite caches               |
-| `doctor`        | Health check (12 system + toolchain + project checks)  |
+| `doctor`        | Health check (system + toolchain + project/IndexStore + git checks) |
 | `cache list`    | List cached SQLite files                               |
 | `cache clear`   | Remove cached SQLite files                             |
 | `search NAME`   | Substring search by symbol name (case-insensitive)     |
@@ -59,6 +59,7 @@ when Xcode rebuilds (different hash → fresh dump).
 | `neighbors USR` | 1-hop union of relations both directions               |
 | `reach USR`     | Transitive closure (`--up\|--down`, `--depth`, `--to-module`) |
 | `impact TARGET` | Bidirectional call/usage stacks for a method or type   |
+| `git [BASE]`    | Map git diff hunks to enclosing symbols + emit ready-to-paste `impact`/`file` commands |
 
 ## Output engine (level × format)
 

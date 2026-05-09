@@ -78,3 +78,18 @@ def test_impact_does_not_steal_file_shorthand():
     # If shorthand stole the call to impact, error would mention 'target_not_found'
     # via name lookup; with file dispatch we get 'file_not_indexed' or project-discovery error.
     assert "ambiguous_name" not in proc.stderr
+
+
+def test_git_subcommand_help_works():
+    proc = _xcindex("git", "--help")
+    assert proc.returncode == 0
+    assert "git" in proc.stdout.lower()
+    assert "--staged" in proc.stdout
+
+
+def test_git_does_not_collide_with_file_shorthand():
+    """`xcindex git` resolves to the git subcommand, not the file shorthand."""
+    proc = _xcindex("git", "--help")
+    assert proc.returncode == 0
+    # file shorthand would have errored on `git` not being a file name
+    assert "file not found in index" not in proc.stderr

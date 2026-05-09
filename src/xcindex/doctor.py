@@ -10,6 +10,7 @@ from pathlib import Path
 
 from xcindex import cache as cache_module
 from xcindex import discovery
+from xcindex import git_diff as git_diff_module
 from xcindex import helper as helper_module
 
 STATUS_OK = "ok"
@@ -309,6 +310,45 @@ def check_helper_version() -> CheckResult:
     )
 
 
+def check_git_repo(cwd: Path | None = None) -> CheckResult:
+    """Detect whether the working directory is inside a git repo and
+    whether the `git` CLI is reachable. Required only by `xcindex git`."""
+    if shutil.which("git") is None:
+        return CheckResult(
+            name="git",
+            status=STATUS_INFO,
+            detail="git CLI not on PATH (xcindex git unavailable)",
+            fix="install git via Xcode CLT or `brew install git`",
+            group=GROUP_PROJECT,
+        )
+    target = Path(cwd) if cwd is not None else Path.cwd()
+    if not git_diff_module.is_git_repo(target):
+        return CheckResult(
+            name="git",
+            status=STATUS_INFO,
+            detail=f"not inside a git working tree: {target}",
+            fix="run `git init` or invoke xcindex from inside a checkout to enable `xcindex git`",
+            group=GROUP_PROJECT,
+        )
+    try:
+        base = git_diff_module.detect_default_base(target)
+    except git_diff_module.GitError as exc:
+        return CheckResult(
+            name="git",
+            status=STATUS_WARN,
+            detail=f"git repo detected but base ref check failed: {exc}",
+            group=GROUP_PROJECT,
+        )
+    branch_proc = _run(["git", "-C", str(target), "rev-parse", "--abbrev-ref", "HEAD"])
+    branch = branch_proc.stdout.strip() if branch_proc.returncode == 0 else "(detached)"
+    return CheckResult(
+        name="git",
+        status=STATUS_OK,
+        detail=f"branch={branch} base={base}",
+        group=GROUP_PROJECT,
+    )
+
+
 def check_pipx() -> CheckResult:
     if shutil.which("pipx") is None:
         return CheckResult(
@@ -349,6 +389,7 @@ def run_all_checks(
             index_store_override=index_store_override,
             derived_data_override=derived_data_override,
         ),
+        check_git_repo(cwd),
     ]
 
 
