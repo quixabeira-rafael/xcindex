@@ -9,6 +9,7 @@ from xcindex.commands import at as at_commands
 from xcindex.commands import cache as cache_commands
 from xcindex.commands import containing as containing_commands
 from xcindex.commands import doctor as doctor_commands
+from xcindex.commands import file as file_commands
 from xcindex.commands import neighbors as neighbors_commands
 from xcindex.commands import occurrences as occurrences_commands
 from xcindex.commands import reach as reach_commands
@@ -34,6 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
     cache_commands.register(subparsers)
     at_commands.register(subparsers)
     containing_commands.register(subparsers)
+    file_commands.register(subparsers)
     symbol_commands.register(subparsers)
     occurrences_commands.register(subparsers)
     relations_commands.register(subparsers)
@@ -50,6 +52,9 @@ def _json_mode(args: argparse.Namespace) -> bool:
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
+    if argv is None:
+        argv = sys.argv[1:]
+    argv = _expand_file_shorthand(parser, list(argv))
     args = parser.parse_args(argv)
 
     func = getattr(args, "func", None)
@@ -95,6 +100,24 @@ def main(argv: list[str] | None = None) -> int:
             json_mode=_json_mode(args),
             exit_code=EXIT_SYSTEM,
         )
+
+
+def _expand_file_shorthand(parser: argparse.ArgumentParser, argv: list[str]) -> list[str]:
+    """Treat `xcindex <file>` as `xcindex file <file>` when the first positional
+    isn't a known subcommand. Leaves explicit subcommands and `-`-prefixed flags
+    untouched.
+    """
+    if not argv or argv[0].startswith("-"):
+        return argv
+    subparsers_action = next(
+        (a for a in parser._actions if isinstance(a, argparse._SubParsersAction)),
+        None,
+    )
+    if subparsers_action is None:
+        return argv
+    if argv[0] in subparsers_action.choices:
+        return argv
+    return ["file", *argv]
 
 
 def _format_os_error(prefix: str, exc: OSError) -> str:

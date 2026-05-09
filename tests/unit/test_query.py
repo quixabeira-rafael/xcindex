@@ -213,6 +213,63 @@ def test_query_search_filter_by_module(populated_conn):
     assert out["items"][0]["name"] == "SubFoo"
 
 
+# --- find_files_in_index / query_file_definitions --------------------------
+
+def test_find_files_by_basename(populated_conn):
+    matches = query_module.find_files_in_index(populated_conn, "Foo.swift")
+    assert matches == ["Core/Foo.swift"]
+
+
+def test_find_files_by_stem_no_extension(populated_conn):
+    matches = query_module.find_files_in_index(populated_conn, "Caller")
+    assert matches == ["UI/Caller.swift"]
+
+
+def test_find_files_by_full_path_exact_match(populated_conn):
+    matches = query_module.find_files_in_index(populated_conn, "Core/Foo.swift")
+    assert matches == ["Core/Foo.swift"]
+
+
+def test_find_files_returns_empty_when_missing(populated_conn):
+    assert query_module.find_files_in_index(populated_conn, "Nope.swift") == []
+
+
+def test_find_files_returns_all_basename_collisions(populated_conn):
+    cur = populated_conn.cursor()
+    cur.execute(
+        "INSERT INTO symbols(usr, name, kind, sub_kind, language, module, file, line, is_system, properties) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("dupfoo", "DupFoo", "class", None, "swift", "Other", "Other/Foo.swift", 1, 0, 0),
+    )
+    populated_conn.commit()
+    matches = query_module.find_files_in_index(populated_conn, "Foo.swift")
+    assert set(matches) == {"Core/Foo.swift", "Other/Foo.swift"}
+
+
+def test_query_file_definitions_default_kinds(populated_conn):
+    out = query_module.query_file_definitions(
+        populated_conn, "Core/Foo.swift", kinds=("class", "struct", "enum", "protocol"),
+    )
+    assert out["summary"]["count"] == 1
+    assert out["items"][0]["name"] == "Foo"
+    assert out["items"][0]["usr"] == "foo"
+    assert out["items"][0]["kind"] == "class"
+
+
+def test_query_file_definitions_all_kinds(populated_conn):
+    out = query_module.query_file_definitions(populated_conn, "Core/Foo.swift")
+    names = [it["name"] for it in out["items"]]
+    assert "Foo" in names and "bar()" in names and "qux()" in names
+    assert out["summary"]["by_kind"]["class"] == 1
+    assert out["summary"]["by_kind"]["instance-method"] == 2
+
+
+def test_query_file_definitions_no_match(populated_conn):
+    out = query_module.query_file_definitions(populated_conn, "Nope.swift")
+    assert out["summary"]["found"] is False
+    assert out["items"] == []
+
+
 # --- decode_roles -----------------------------------------------------------
 
 def test_decode_roles_definition_bit():

@@ -441,6 +441,89 @@ def query_reach(
     }
 
 
+def find_files_in_index(conn: sqlite3.Connection, input_str: str) -> list[str]:
+    """Resolve a user-supplied file argument to indexed file paths.
+
+    The input may be:
+      - an absolute or relative path (matched exactly after resolution),
+      - a filename with extension (matched as basename suffix),
+      - a bare filename (matched against any extension).
+    """
+    cursor = conn.cursor()
+    p = Path(input_str)
+
+    if "/" in input_str or input_str.startswith("~"):
+        expanded = p.expanduser()
+        try:
+            resolved = str(expanded.resolve())
+        except OSError:
+            resolved = str(expanded)
+        cursor.execute(
+            "SELECT DISTINCT file FROM symbols WHERE file = ?",
+            (resolved,),
+        )
+        row = cursor.fetchone()
+        if row is not None and row[0]:
+            return [row[0]]
+
+    name = p.name or input_str
+    if "." in name:
+        like = f"%/{name}"
+    else:
+        like = f"%/{name}.%"
+    cursor.execute(
+        "SELECT DISTINCT file FROM symbols WHERE file LIKE ? AND is_system = 0 ORDER BY file",
+        (like,),
+    )
+    return [row[0] for row in cursor.fetchall() if row[0]]
+
+
+def query_file_definitions(
+    conn: sqlite3.Connection,
+    file: str,
+    *,
+    kinds: tuple[str, ...] | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """List symbols defined in a given file, optionally filtered by kind."""
+    cursor = conn.cursor()
+    params: list[Any] = [file]
+    where_kind = ""
+    if kinds:
+        placeholders = ",".join(["?"] * len(kinds))
+        where_kind = f"AND kind IN ({placeholders})"
+        params.extend(kinds)
+    params.append(limit + 1)
+    cursor.execute(
+        f"""
+        SELECT usr, name, kind, sub_kind, language, module, file, line, is_system, properties
+        FROM symbols
+        WHERE file = ? {where_kind} AND is_system = 0
+        ORDER BY line, name
+        LIMIT ?
+        """,
+        params,
+    )
+    rows = cursor.fetchall()
+    truncated = len(rows) > limit
+    rows = rows[:limit]
+    items = [_symbol_item(row) for row in rows]
+    by_kind: dict[str, int] = {}
+    for it in items:
+        by_kind[it["kind"]] = by_kind.get(it["kind"], 0) + 1
+    return {
+        "kind": "file",
+        "anchor": {"file": file, "filter_kinds": list(kinds) if kinds else None},
+        "summary": {
+            "found": bool(items),
+            "count": len(items),
+            "by_kind": by_kind,
+        },
+        "items": items,
+        "truncated": truncated,
+    }
+
+
 def query_search(
     conn: sqlite3.Connection,
     pattern: str,

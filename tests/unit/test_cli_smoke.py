@@ -49,3 +49,12 @@ def test_cache_subcommand_required():
 def test_setup_subcommand_required():
     proc = _xcindex("setup")
     assert proc.returncode == 1
+
+
+def test_file_shorthand_expands_to_file_subcommand():
+    """`xcindex Foo.swift` outside a project should fail like `xcindex file Foo.swift`,
+    proving the parser dispatches to the file command rather than rejecting the arg."""
+    foreign = _xcindex("file", "ZZZ_NotARealFile_xyz.swift")
+    short = _xcindex("ZZZ_NotARealFile_xyz.swift")
+    assert foreign.returncode == short.returncode
+    assert foreign.stderr.splitlines()[-1] == short.stderr.splitlines()[-1]

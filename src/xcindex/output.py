@@ -220,7 +220,10 @@ def _render_agent(projected: dict[str, Any]) -> str:
             parts.append(body)
 
     if items:
-        parts.append(_agent_items_block(items))
+        if kind == "file":
+            parts.append(render_table(items, [("kind", "kind"), ("name", "name"), ("usr", "usr")]))
+        else:
+            parts.append(_agent_items_block(items))
 
     if truncated:
         parts.append("_truncated: results were limited; refine query or raise --limit_")
