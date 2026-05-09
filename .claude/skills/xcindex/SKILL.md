@@ -1,200 +1,255 @@
 ---
 name: xcindex
-description: Query the Xcode IndexStore of a Swift/Objective-C project for symbols, references, and reachability using the xcindex CLI. Use when the user asks to find a symbol, locate where a class/method is used, identify the blast radius of a change, list call sites or subclasses, find what's at file:line, ask "what depends on this", or any "who-uses-X / what-does-X-call" question on an Xcode project. Trigger phrases include "blast radius", "find references", "who calls", "callers of", "where is this used", "what does this depend on", "subclasses of", "implementations of", "find symbol", "what's at file:line", "what method contains this line", or any reference to IndexStore / IndexStoreDB / SourceKit indexing on an Xcode/SwiftPM project.
+description: Query the Xcode IndexStore of a Swift/Objective-C project for branch-level impact, blast radius, file inventory, and symbol search using the xcindex CLI. Use when the user asks "what does this branch touch and what breaks if I ship it", "what's the impact of changing this method/class", "list the types in this file", or "find a symbol named X" on an Xcode / SwiftPM project. Trigger phrases include "blast radius", "impact of this change", "what does this branch touch", "what would break if I change X", "who calls", "callers of", "subclasses of", "find symbol named", "types in this file", "what's in this Swift file", or any reference to IndexStore / IndexStoreDB on an Xcode workspace.
 ---
 
 # xcindex
 
-CLI that materializes Xcode's IndexStore into a per-project SQLite cache and answers symbol/reference/reachability queries against it. Designed to be operated by an agent: every subcommand emits a stable JSON shape with `--json`.
+CLI that materializes Xcode's IndexStore into a per-project SQLite cache and answers symbol/reference/reachability/impact queries against it. Designed to be operated by an agent: every subcommand emits a stable JSON shape with `--format json`, and a stack-frame-style markdown shape by default (`--format agent`).
 
-## Mental model (read first)
+## What this skill covers
 
-Seven facts that are not obvious from `--help`:
+The four daily-driver commands have rich workflows below. Everything else is a primitive — invoke the relevant `--help` and read the output:
 
-1. **xcindex queries the IndexStore, never the source code.** The compiler writes the IndexStore as a side effect of every build. If the project hasn't been rebuilt since a code change, queries reflect the *previous* build state. Use `--check-fresh` to surface a warning when source files are newer than the latest unit; use `--require-fresh` to fail with exit 4 (`EXIT_STALE_INDEX`).
-
-2. **First query bootstraps a SQLite cache.** The Swift helper walks the IndexStore via the libIndexStore C API and writes `~/.cache/xcindex/<project_fingerprint>/index.sqlite`. Cold dump on a large iOS workspace is ~30s; subsequent queries are <500ms. The cache is keyed by absolute project path.
-
-3. **Tuist regen forces a full re-bootstrap.** `tuist generate` rewrites the IndexStore directory; xcindex's unit delta detector sees every unit as "added" and falls back to a fresh cold dump. On Tuist projects this happens daily, not once.
-
-4. **Cache invalidation is per-unit, mtime + size.** Edit one Swift file, rebuild, and the next query runs an incremental update (~1s) — only that file's symbols/occurrences/relations are deleted and re-inserted. New units fall back to full re-bootstrap (we can't infer their files yet); removed units are cleaned up in place.
-
-5. **System symbols are excluded by default.** UIKit, Foundation, SwiftUI, and SDK frameworks are filtered unless you pass `--include-system`. Including them bloats the cache, slows the cold dump, and drowns project-symbol queries in SDK noise. Reach for `--include-system` only when the question is explicitly about an SDK type.
-
-6. **USRs are the canonical handle.** Plain names collide (overloads, the same name in different modules, extension symbols vs the type they extend). The IndexStore identifies symbols by USR (`s:11ModuleName10TypeNameC...`). Most commands take a USR. Resolve name → USR with `xcindex symbol --name X --json` or `xcindex search X --json`, then drive the rest of the workflow off the USR.
-
-7. **JSON is the agent contract.** Every subcommand accepts `--json`. Stable shape: `{kind, anchor, summary, items, truncated, warnings}`. `summary.found` and `summary.count` are always present. `items` may be elided when `--level count`. Errors in JSON mode go to stderr as `{"error": "<code>", "message": "..."}`. Use `--json` when parsing programmatically.
-
-## When to invoke this skill
-
-- "What's at `Foo.swift:42`?" → `xcindex at Foo.swift:42`
-- "What method/class contains `Foo.swift:42`?" → `xcindex containing Foo.swift:42`
-- "Find a symbol named `PriceCalculator`" → `xcindex search PriceCalculator` or `xcindex symbol --name PriceCalculator`
-- "Where is `Money` used?" → `xcindex symbol --name Money` to get USR, then `xcindex occurrences <usr>`
-- "Who calls `applyDiscount`?" → `xcindex reach <usr> --direction up --kinds calledBy`
-- "What does `processCheckout` depend on?" → `xcindex reach <usr> --direction down`
-- "Subclasses of `BaseViewController`" → `xcindex relations <usr> --direction in --kind baseOf`
-- "Why is xcindex broken / where's the cache?" → `xcindex doctor`, `xcindex cache list`
-
-## Workflow A — first-time setup
-
-```bash
-xcindex setup install        # one-time: builds the Swift helper (~60s)
-xcindex doctor               # sanity check: macOS, Swift, project discovery, cache dir
-cd /path/to/your/Xcode/project
-xcodebuild -workspace ... -scheme ... build   # OR build in Xcode
-# (the build is what produces the IndexStore xcindex queries)
-xcindex search SomeSymbol    # first query: bootstraps the cache (~10–30s)
-```
-
-`setup install` is idempotent. After a `pipx reinstall xcindex` it auto-rebuilds the helper if the schema bumped. If the user ran `pipx install -e .` from the repo, `xcindex skill install` is also offered during setup install (when Claude Code is detected on the machine).
-
-## Workflow B — locate a symbol
-
-```bash
-# Substring match across all project symbols (NOCASE)
-xcindex search Receipt --kind class --json
-
-# Exact name (returns all overloads / homonyms)
-xcindex symbol --name PriceCalculator --json
-
-# Already have a USR (from a previous query)
-xcindex symbol s:11ModuleName10TypeNameC --json
-
-# Symbol at a cursor position
-xcindex at Sources/Money.swift:14:8 --json
-
-# Enclosing symbol for a line (no column needed)
-xcindex containing Sources/Money.swift:42 --json
-```
-
-`--kind` and `--module` filters apply to `search`. `--limit` defaults to 50; results carry `truncated: true` when the cap is hit.
-
-## Workflow C — find references
-
-```bash
-# All occurrences of a symbol (definition + references + calls + writes…)
-xcindex occurrences <usr> --json
-
-# Filter to one role (declaration, definition, reference, read, write, call, dynamic, addressOf, implicit)
-xcindex occurrences <usr> --role call --json
-xcindex occurrences <usr> --role write --json
-
-# 1-hop graph around the symbol (relations in/out without filtering)
-xcindex neighbors <usr> --json
-xcindex neighbors <usr> --kind calledBy --direction in --json
-```
-
-`relations` is the lower-level form: `xcindex relations <usr> --direction in --kind baseOf` is "who inherits from this" while `--direction out --kind calledBy` is "what does this call". `neighbors` is the union of both directions.
-
-## Workflow D — blast radius (the headline use case)
-
-```bash
-# Who transitively uses this symbol? (callers of callers, …)
-xcindex reach <usr> --direction up --max-depth 8 --json
-
-# What does this symbol transitively use?
-xcindex reach <usr> --direction down --max-depth 8 --json
-
-# Limit traversal to specific relation kinds
-xcindex reach <usr> --direction up --kinds calledBy,overrideOf --json
-
-# Constrain output to a single module (still traverses through any module)
-xcindex reach <usr> --direction up --to-module FeatureCheckout --json
-```
-
-Default traversal kinds: `calledBy, containedBy, childOf, overrideOf, baseOf, specializationOf, extendedBy`. The `summary.by_module` and `summary.by_depth` breakdowns are usually more useful than the raw `items` list when reporting a blast radius back to the user.
-
-## Workflow E — after editing source
-
-```bash
-# Edit Money.swift in your editor
-xcodebuild ... build           # rebuild → updates the IndexStore unit for Money.swift
-xcindex search Money --json    # automatic incremental update (~1s) before the query
-```
-
-xcindex compares each unit's `(size, mtime)` against the cache before answering; modified units trigger an incremental DELETE+INSERT scoped to those files. No manual invalidation needed. To verify the cache is fresh against source files, add `--check-fresh` (warning) or `--require-fresh` (hard fail with exit 4).
-
-## Workflow F — clean / inspect cache
-
-```bash
-xcindex cache list --json                   # all caches across all projects
-xcindex cache list --project . --json       # caches for the current project
-xcindex cache clear                         # nuke the active project's cache (forces re-bootstrap)
-xcindex cache clear --all                   # nuke ~/.cache/xcindex entirely
-```
-
-Each project's cache directory holds the live `index.sqlite` plus up to 3 `legacy_*.sqlite` snapshots (preserved across schema bumps for forensics; trimmed via GC).
-
-## Command reference
-
-| Command | Purpose | Key flags |
+| Command | Day-to-day use? | Where to learn |
 |---|---|---|
-| `at FILE:LINE[:COL]` | Symbols at a file position | resolves to one or many occurrences |
-| `containing FILE:LINE` | Smallest enclosing symbol for a line | heuristic: largest symbol-line ≤ target line |
-| `symbol {USR \| --name NAME}` | Look up symbol details | returns all matches when --name (overloads) |
-| `search PATTERN` | Substring (NOCASE) on symbol names | `--kind`, `--module`, `--limit` |
-| `occurrences USR` | All occurrences of a symbol | `--role` (one of declaration/definition/reference/read/write/call/dynamic/addressOf/implicit) |
-| `relations USR` | Relations involving the symbol | `--direction in/out`, `--kind` (calledBy, baseOf, …) |
-| `neighbors USR` | 1-hop union of in+out relations | `--direction both/in/out`, `--kind` |
-| `reach USR` | Transitive closure via recursive CTE | `--direction up/down`, `--max-depth N`, `--kinds k1,k2`, `--to-module M` |
-| `cache {list,clear}` | Inspect or nuke the on-disk cache | `--all` for `clear`; `--project` for `list` |
-| `doctor` | Health check (macOS, Swift, project, IndexStore, cache, helper) | exits 0/2/3 by severity; prints `fix:` hints |
-| `setup {install,uninstall}` | Build the Swift helper, prepare dirs | `--with-skill` / `--skip-skill` for the Claude skill prompt |
-| `skill {install,uninstall,status}` | Install/remove the Claude Code skill at user level | symlinks `~/.claude/skills/xcindex/SKILL.md` |
+| **`git`** | ✅ start every session | this skill, "Workflow A" |
+| **`impact`** | ✅ drill into one symbol | this skill, "Workflow B" |
+| **`file`** | ✅ inventory a file | this skill, "Workflow C" |
+| **`search`** | ✅ locate a symbol by name | this skill, "Workflow D" |
+| `at`, `containing`, `symbol`, `occurrences`, `relations`, `neighbors`, `reach` | primitives | run `xcindex <cmd> --help` |
+| `cache`, `doctor`, `setup`, `skill` | infra | run `xcindex <cmd> --help` |
 
-Every subcommand accepts `--json`. Project-scoped commands (everything except `setup`, `doctor`, `cache list --all`) also accept `--project PATH`, `--index-store PATH`, `--derived-data PATH`, `--include-system`, `--check-fresh`, `--require-fresh`.
+If the question maps cleanly to one of the four primary commands, use it. The primitives still exist for power-user queries (e.g. role-filtered occurrences, hand-tuned reach traversals) — fall through to `--help` when the daily commands aren't enough.
 
-Output projection (for the non-JSON renderers): `--level count|summary|locations|detailed`, `--format agent|json|jsonl|compact`. `--format json` is equivalent to `--json`.
+## Mental model (read once)
 
-Exit codes: `0` success, `1` usage error, `2` invalid state, `3` system failure, `4` stale index (only when `--require-fresh`).
+Six facts that change how you should call xcindex:
 
-## Roles and relation kinds
+1. **xcindex queries the IndexStore, never the live source.** The compiler writes the IndexStore as a side effect of every build. If the project hasn't been rebuilt since a code change, queries reflect the *previous* build state. After editing source, rebuild before drawing conclusions. Add `--check-fresh` to surface a warning, or `--require-fresh` to fail with exit 4.
 
-**Occurrence roles** (bitmask in `roles`, decoded in `summary.by_role` and `items[].roles`):
-`declaration, definition, reference, read, write, call, dynamic, addressOf, implicit`.
+2. **First query bootstraps a per-project SQLite cache.** Cold dump on a large iOS workspace is ~15–30s; subsequent queries are <500ms. The cache lives at `~/.cache/xcindex/<project_fingerprint>/index.sqlite` and is keyed by absolute project path. Don't kill the first query — it's not stuck, it's bootstrapping.
 
-**Relation kinds** (in `r.kind`):
-`childOf, baseOf, overrideOf, receivedBy, calledBy, extendedBy, accessorOf, containedBy, ibTypeOf, specializationOf`. `other` for unclassified.
+3. **Cache invalidation is per-unit, mtime + size.** Edit one file, rebuild, the next query runs an incremental update (~1s). New source files fall back to a full re-bootstrap. Tuist `tuist generate` rewrites every unit, so it forces a cold dump too.
 
-`reach` defaults to traversing `calledBy, containedBy, childOf, overrideOf, baseOf, specializationOf, extendedBy` — call graphs and inheritance chains.
+4. **System symbols are excluded by default.** UIKit/Foundation/SwiftUI noise stays out unless you pass `--include-system`. Reach for `--include-system` only when the question is explicitly about an SDK type.
 
-## When something is broken
+5. **USRs are the canonical handle.** Names collide; USRs (`s:11Module10TypeNameC...`, `c:@M@Module@objc(cs)Foo`) don't. Most commands take a USR. Resolve names to USRs once via `search`/`file`/`git`, then drive the rest of the workflow off the returned USR. ObjC USRs contain `()` so always wrap them in single quotes when pasting into a shell: `xcindex impact 'c:@M@Foo@objc(cs)Bar'` — xcindex's own next-step output already does this.
 
-Run `xcindex doctor` first. It runs a fixed checklist (macOS version, Python version, xcrun, Swift toolchain, pipx, cache dir, helper presence, helper version match, project discovery, IndexStore freshness) and prints a `fix:` hint for each non-OK row. Beats guessing.
+6. **Output format defaults are tuned for agents.** Default is markdown with stack frames / tables / next-step suggestions. Pass `--format json` for programmatic parsing; the JSON shape is stable: `{kind, mode?, anchor, summary, items|stacks|files, truncated, warnings}`.
 
-## Gotchas checklist
+## Workflow A — what does this branch touch? (`xcindex git`)
 
-- **`could not discover project`** → the cwd doesn't contain `.xcodeproj`/`.xcworkspace`/`Package.swift`. `cd` to the project root or pass `--project /path/to/project`.
-- **`could not discover index store`** → the project hasn't been built. Build in Xcode (or `xcodebuild build`) to populate the IndexStore at `<DerivedData>/<project>-<hash>/Index.noindex/DataStore`.
-- **First query is "stuck" for 30 seconds** → that's the cold dump (helper bootstrapping the SQLite cache). It only happens once per IndexStore content. Don't kill it.
-- **Cold dump happens *every* time** → likely a Tuist project regenerating the IndexStore. Expected. The dump is ~15–30s on large workspaces; nothing else is wasted, the cache is reused once stable.
-- **`schema upgraded to v3; preserved N legacy snapshot(s)`** → harmless; the schema version bumped, the old SQLite was kept for forensics under `legacy_*.sqlite` and a fresh one was bootstrapped. No data lost.
-- **Searches for `UIView`, `UITableView`, etc. return 0 hits** → SDK symbols are filtered by default. Re-run with `--include-system`. Cache rebuilds with system symbols are larger and slower; consider whether the question really requires it.
-- **`reach` returns nothing for a symbol that obviously has callers** → check `--max-depth` (default 8) and `--kinds`. The default kind set excludes `accessorOf` and `receivedBy`; pass `--kinds calledBy` explicitly when you only care about the call graph.
-- **`occurrences --role definition` returns 0** → the symbol is declared but never defined in the project (e.g., a protocol requirement, an Obj-C method bridged from a header). Try without `--role`, then read the role bitmask on each item.
-- **A USR you saved a week ago no longer resolves** → IndexStore USRs are stable across builds for the same Swift compiler version, but a Swift toolchain upgrade can change them. Re-run `search` to find the new USR.
-- **`--check-fresh` is slow on large repos** → it walks the project tree. Default is OFF for that reason. Only opt in when freshness matters for the question being asked.
-- **Helper schema mismatch loop** → `xcindex setup install` rebuilds the helper. If `xcindex doctor` shows `helper-version: warn (schema X, expected Y)`, run setup install.
+The most common question at the start of a review session: "I have a branch open — what symbols did it touch and what breaks if I ship it?" `xcindex git` answers this in one shot.
 
-## JSON-mode contract
+```bash
+# default base (origin/main → main → HEAD~1) — entire branch's diff vs main
+xcindex git
 
-Every command emits a single JSON object on stdout with `--json`. Stable top-level keys:
+# explicit base
+xcindex git main
+xcindex git HEAD~3
+xcindex git release/2025.10
 
-- `kind` — query family (`at`, `containing`, `symbol`, `occurrences`, `relations`, `neighbors`, `reach`, `search`, …).
-- `anchor` — what was queried (USR, name, file:line, pattern, …).
-- `summary` — counts and breakdowns (`found`, `count`, `files`, `by_role`, `by_kind`, `by_module`, `by_depth`, …).
-- `items` — per-result rows (omitted when `--level count`). Each row carries `name`, `usr`, `kind`, `module`, `language`, `file`, `line`, `column`, plus query-specific fields (`roles`, `container`, `rel_kind`, `rel_roles`, `site`, `depth`).
-- `truncated` — boolean; true when results were capped by `--limit`.
-- `warnings` — list of strings; staleness warnings appear here when `--check-fresh` is set.
+# only staged changes (pre-commit workflow)
+xcindex git --staged
+```
 
-Errors emit `{"error": "<code>", "message": "..."}` on stderr (still single-line JSON). Exit codes are normative.
+Output structure:
+- **One block per modified Swift/ObjC file**, listing the modified line range, the enclosing symbol's name, kind, and USR (one line per symbol, deduped by USR).
+- **`**next steps**` block** with copy-paste commands:
+  - `xcindex file <path>` for each modified file
+  - `xcindex impact <usr>` for each modified symbol
+- **Warnings** for added files (not yet indexed → rebuild) and deleted/renamed files.
+
+Decision-making after running `git`:
+- Few symbols touched → run `xcindex impact <usr>` on each one to assess blast radius.
+- Many symbols touched → look at the file list first; ones with the most-touched core symbols are the riskiest. Drill into those first.
+- Added file warning → ask the user to rebuild before continuing.
+
+```bash
+# typical session
+xcindex git                                            # see what the branch did
+xcindex impact 's:6WWCore11AuthManagerC...refreshyyF'  # drill into a flagged symbol
+xcindex file 'Sources/Core/OrderProcessor.swift'       # cross-check what other types live nearby
+```
+
+## Workflow B — blast radius of one symbol (`xcindex impact`)
+
+`xcindex impact` is the headline query. It produces **bidirectional call/usage stacks** in stack-frame format (like an Xcode debugger): a list of independent paths from each terminal caller up to the target, plus paths from the target down to each terminal callee.
+
+Three modes, dispatched by the target's kind:
+
+| Target kind | Mode | What you get |
+|---|---|---|
+| `instance-method`, `class-method`, `static-method`, `function`, `constructor`, `destructor` | **call_stack** | upstream stacks (callers via `calledBy` + `overrideOf`) and downstream stacks (callees via `calledBy` inverted) |
+| `class`, `struct`, `enum`, `protocol` | **usage_chain** | upstream usage chains (level 1 = reference containers, then BFS via callers) + a flat structure block (members, subclasses/conformers, extensions) |
+| anything else (property, extension, typealias, parameter, enum-case, …) | **hint_only** | no stack walk; emits 3-5 kind-appropriate `xcindex` follow-up commands |
+
+Input forms (same flexibility as `xcindex file`):
+
+```bash
+# By file:line — resolves to the enclosing symbol
+xcindex impact Sources/Core/AuthManager.swift:42
+
+# By name — errors with shell-safe candidates if ambiguous
+xcindex impact 'attemptLogin(_:)'
+
+# By USR (Swift)
+xcindex impact 's:6WWCore11AuthManagerC...attemptLoginyyF'
+
+# By USR (ObjC) — quote because of the parens
+xcindex impact 'c:@M@WWMobile@objc(cs)AppDelegate(im)init'
+```
+
+Tuning flags:
+
+```bash
+# Default depth=8, max-stacks=10 per direction. Bump for highly-connected symbols:
+xcindex impact <usr> --depth 12 --max-stacks 25
+
+# Restrict to where impact lands in a specific module
+xcindex impact <usr> --to-module WWMobileUI
+
+# Strict call-only (skip overrideOf — useful if you're not changing the signature)
+xcindex impact <usr> --no-overrides
+
+# One direction only
+xcindex impact <usr> --up-only       # who calls me
+xcindex impact <usr> --down-only     # what do I call
+```
+
+Reading the output:
+- Each `[upstream stack N] depth K (edge_kinds)` is one independent path. Read top-to-bottom: row 0 is the entry point (test, scene root, etc.), last row is the target.
+- Edge kinds in the header tell you what kind of edge connects the frames (e.g. `(overrideOf)` means at least one frame is an override, not a direct call).
+- `(external)` frames are SDK / Foundation / XCTest internals — no file:line because they're outside the indexed code.
+- `**summary**` block: `transitive_count`, `module_count`, `by_module`, `by_depth`, `by_edge_kind`. Use these to answer "how big is the blast radius" without reading every stack.
+
+For type targets the **`**structure**`** block lists members/subclasses/extensions — call `xcindex impact` again on a specific member to drill in.
+
+## Workflow C — what types are in this file? (`xcindex file`)
+
+Inventory a file before refactoring, or expand on a `git` finding. Default output is a table of top-level types (class/struct/enum/protocol); `--all` widens to every definition (methods, properties, extensions, parameters).
+
+```bash
+# Shorthand: `xcindex <file>` → same as `xcindex file <file>`
+xcindex Sources/Core/AuthManager.swift
+xcindex AuthManager.swift            # filename only
+xcindex AuthManager                  # bare stem (any extension)
+
+# Explicit
+xcindex file Sources/Core/AuthManager.swift
+
+# Everything in the file, not just top-level types
+xcindex file Sources/Core/AuthManager.swift --all --limit 200
+```
+
+Multiple files matching the same basename → error with a copy-paste-ready list of full paths (one `xcindex` invocation per match). Common in iOS workspaces with many `AppDelegate.swift`.
+
+The output table has **kind / name / USR** columns. Use the USRs to follow up with `xcindex impact <usr>`. The default output also includes a **`**next steps**`** block with kind-aware suggestions (subclasses, extensions, members for types; callers, override chain for methods; reads/writes for properties).
+
+## Workflow D — find a symbol by name (`xcindex search`)
+
+Substring search (case-insensitive) when you know roughly what you're looking for but not the exact USR or location.
+
+```bash
+xcindex search PriceCalculator
+xcindex search Receipt --kind class --limit 20
+xcindex search login --kind instance-method --module WWCore
+xcindex search Order --format json --level detailed   # programmatic
+```
+
+Filters:
+- `--kind` — narrow by kind (`class`, `struct`, `instance-method`, etc.)
+- `--module` — narrow to one Swift module
+- `--limit` — default 50, hard-cap with `truncated: true` flag
+
+`search` is the right entry when:
+- The user described a symbol by name and you need its USR.
+- You're hunting for naming patterns (`xcindex search ViewController --kind class`).
+- You need a population estimate ("how many `setUp` methods exist?").
+
+When the user gives an exact name and there's likely one match, prefer `xcindex symbol --name <name>` (use `xcindex symbol --help`) — it returns immediately without substring noise.
+
+## Everything else: read `--help`
+
+These primitives back the headline commands and are still useful for power-user queries — but the daily flow rarely needs them directly:
+
+```bash
+xcindex at --help            # symbols at file:line[:column]
+xcindex containing --help    # smallest enclosing symbol for a line
+xcindex symbol --help        # exact USR/name lookup
+xcindex occurrences --help   # all occurrences of a USR (filterable by --role)
+xcindex relations --help     # 1-hop relations (--direction in/out, --kind X)
+xcindex neighbors --help     # union of in+out 1-hop relations
+xcindex reach --help         # transitive closure (raw, flat output — `impact` is usually better)
+xcindex cache --help         # inspect/clear the SQLite cache
+xcindex doctor --help        # health check (run when something feels wrong)
+xcindex setup --help         # build/reinstall the Swift helper
+xcindex skill --help         # install/uninstall this Claude Code skill
+```
+
+Rule of thumb: if you reach for `relations` / `reach` / `occurrences`, ask whether `impact` answers the same question with better defaults. If yes, prefer `impact`.
+
+## JSON contract
+
+Every command accepts `--format json` (or `--json` on `doctor`). Stable top-level keys:
+
+- `kind` — query family (`git`, `impact`, `file`, `search`, …)
+- `mode` — present on `impact` only (`call_stack` / `usage_chain` / `hint_only`)
+- `anchor` — what was queried (USR, file:line, base ref, …)
+- `summary` — counts and breakdowns (`found`, `count`, `by_kind`, `by_module`, `by_depth`, …)
+- `items` / `stacks` / `files` — depending on `kind` (mutually exclusive — read the kind first to know which key to expect)
+- `truncated` — `true` when results were capped
+- `warnings` — list of strings (staleness, indexing notes)
+
+Errors emit `{"error": "<code>", "message": "..."}` on stderr. Exit codes are normative:
+- `0` success
+- `1` usage error
+- `2` invalid state (project not found, target not in index, ambiguous name, …)
+- `3` system error (IO/permissions)
+- `4` stale index (only with `--require-fresh`)
+
+## Output projection
+
+Two orthogonal axes apply to every command:
+
+- `--level count|summary|locations|detailed` — how much detail per item (default varies by command; `impact` defaults to `locations`, others to `summary`).
+- `--format agent|json|jsonl|compact` — agent (markdown, default), json (single object), jsonl (header + 1 line per item), compact (TSV).
+
+For agent consumption, defaults are tuned. Override only when piping into another tool.
+
+## When something feels wrong: `xcindex doctor`
+
+```bash
+xcindex doctor             # human-readable
+xcindex doctor --json      # programmatic
+```
+
+Runs a fixed checklist (macOS, Python, xcrun, Swift, pipx, cache dir, helper presence, helper schema, project discovery, IndexStore freshness, **git working tree**) and prints a `fix:` hint per non-OK row. Beats guessing.
+
+If the user reports xcindex "not working" or commands erroring with project/index/cache complaints — start with `xcindex doctor`.
+
+## Gotchas you'll hit
+
+- **`could not discover project`** → cwd has no `.xcodeproj`/`.xcworkspace`/`Package.swift`. cd to the project root or pass `--project /path/to/project`.
+- **`could not discover index store`** → project hasn't been built. Tell the user to run `xcodebuild -workspace ... -scheme ... build` (or build in Xcode).
+- **`xcindex git` says "no indexable file changes detected"** → the diff hit only non-Swift files (Podfile, .yml, etc.) — that's fine, just nothing for xcindex to do.
+- **`xcindex git` flags an added file** → the IndexStore won't have it until next build. Ask the user to rebuild before drilling into that file.
+- **First query is "stuck" for 30 seconds** → cold dump. Wait it out. Only happens once per IndexStore content.
+- **Cold dump every time** → likely a Tuist project regenerating the IndexStore. Expected; nothing wasted.
+- **`xcindex search UIView` returns 0** → SDK symbols filtered. Re-run with `--include-system` if the question is genuinely about an SDK type.
+- **`xcindex impact` returns "no transitive callers/callees found"** → the symbol is genuinely a leaf entry-point, OR the cache is stale. If the user just edited the file, ask them to rebuild.
+- **ObjC USR copy-paste fails in zsh with `nomatch`** → quote it. The skill / CLI output already does this; if you constructed a USR by hand, wrap in `'...'`.
+- **A USR you saved a week ago no longer resolves** → IndexStore USRs are stable across builds for the same Swift version, but a Swift toolchain upgrade changes them. Re-run `search`.
+- **Helper schema mismatch** → `xcindex doctor` will show `helper-version: warn`. Run `xcindex setup install` to rebuild.
 
 ## Performance expectations
 
-- **Cold dump** (first query after `tuist generate` or initial setup): 5–30s depending on project size.
-- **Hot cache hit**: <500ms for any single-symbol query, including `reach`.
-- **Incremental update** (one Swift file edited, rebuilt): ~1s before the next query answers.
-- **`reach` with default depth/kinds**: <500ms even on workspaces with 500k+ occurrences.
+- **Cold dump** (first query / after `tuist generate`): 5–30s.
+- **Hot cache hit**: <500ms for any single-symbol query.
+- **Incremental update** (one file edited, rebuilt): ~1s before the next query.
+- **`xcindex impact` on a deeply-connected symbol**: <2s on workspaces with 500k+ occurrences.
+- **`xcindex git` on a 100-file branch**: <2s including hunk parsing and per-line `containing` resolution.
 
-If a query takes longer than expected with no IndexStore changes, run `xcindex doctor` — most "slow" reports are actually cold dumps masquerading as slow queries.
+If a query takes longer than expected with no IndexStore changes, run `xcindex doctor` — most "slow" reports are cold dumps.
