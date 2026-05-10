@@ -19,6 +19,7 @@ The four daily-driver commands have rich workflows below. Everything else is a p
 | **`search`** | ✅ locate a symbol by name | this skill, "Workflow D" |
 | `at`, `containing`, `symbol`, `occurrences`, `relations`, `neighbors`, `reach` | primitives | run `xcindex <cmd> --help` |
 | `prewarm` | wire into build hooks to keep cache warm | this skill, "Workflow E" |
+| `watch` | foreground watcher that auto-runs prewarm on builds | this skill, "Workflow E" |
 | `cache`, `doctor`, `setup`, `skill` | infra | run `xcindex <cmd> --help` |
 
 If the question maps cleanly to one of the four primary commands, use it. The primitives still exist for power-user queries (e.g. role-filtered occurrences, hand-tuned reach traversals) — fall through to `--help` when the daily commands aren't enough.
@@ -199,14 +200,28 @@ result = materialize(args)
 print(result.mode, result.wall_seconds, result.symbols_added)
 ```
 
-A typical hook (no daemon, no project file modification):
+**Hook option 1 — shell alias** (CLI builds only, simplest setup):
 ```bash
 # ~/.zshrc
 xcb_with_prewarm() { command xcodebuild "$@" && command xcindex prewarm --quiet 2>/dev/null; }
 alias xcodebuild=xcb_with_prewarm
 ```
+Misses builds from the Xcode IDE.
 
-Project-specific hooks (Tuist plugin, scheme post-action, Build Phase) are not yet packaged — that's planned as `xcindex profile` in a follow-up. For now, recommend the alias above when the user asks for "auto" cache warming.
+**Hook option 2 — `xcindex watch`** (covers IDE + CLI builds, ~30MB resident):
+```bash
+xcindex watch                  # foreground; Ctrl+C to stop
+xcindex watch --debounce 1000  # wait 1s after last event before prewarming
+```
+Subscribes to FSEvents on the IndexStore, debounces bursts, spawns `prewarm` per settled event. Single-instance per project. Resilient — keeps running even when individual prewarms fail.
+
+Watcher status is reported by `xcindex doctor`:
+- `[OK] watcher running (pid=…, since…, last prewarm: incremental 0.7s)` — healthy
+- `[!!] watcher running (...) — 3/4 prewarms failed` — escalates to WARN
+- `[--] no watcher running` — info, with `xcindex watch` as fix hint
+- `[XX] stale state file (pid X not running)` — error, auto-cleaned on next start
+
+When the user asks for "auto" cache warming and is fine with a foreground process, recommend Hook 2. When they only build from CLI and don't want a long-running process, recommend Hook 1. Project-aware auto-installation (Tuist plugin, etc.) is deferred to the planned `xcindex profile` feature.
 
 ## Everything else: read `--help`
 

@@ -48,6 +48,7 @@ when Xcode rebuilds (different hash → fresh dump).
 | `setup uninstall` | Remove helper binary and SQLite caches               |
 | `doctor`        | Health check (system + toolchain + project/IndexStore + cache-warm + git checks) |
 | `prewarm`       | Materialize the SQLite cache from the IndexStore (cold/incremental/noop). Wire into a build hook to keep query latency warm. |
+| `watch`         | Foreground process that listens for IndexStore changes and runs `prewarm` automatically (single-instance per project, ~30MB resident, debounced). |
 | `cache list`    | List cached SQLite files                               |
 | `cache clear`   | Remove cached SQLite files                             |
 | `search NAME`   | Substring search by symbol name (case-insensitive)     |
@@ -226,16 +227,43 @@ result = materialize(args)
 print(result.mode, result.wall_seconds)
 ```
 
-Hooks for triggering `prewarm` (Build Phase scripts, scheme post-actions,
-Tuist plugins, watchers) are not yet packaged — that is planned as a
-follow-up `xcindex profile` feature. For now a project-specific shell
-alias around `xcodebuild` is the simplest integration:
+### Hook 1 — shell alias around `xcodebuild` (CLI builds only)
+
+Simplest universal hook. Add to `~/.zshrc`:
 
 ```bash
-# ~/.zshrc
 xcb_with_prewarm() { command xcodebuild "$@" && command xcindex prewarm --quiet 2>/dev/null; }
 alias xcodebuild=xcb_with_prewarm
 ```
+
+Catches every build done via `xcodebuild` from the terminal. Misses builds
+done from the Xcode IDE (use Hook 2 for those).
+
+### Hook 2 — `xcindex watch` (covers IDE builds too)
+
+Foreground process that subscribes to FSEvents on the IndexStore and runs
+`prewarm` automatically when each build settles:
+
+```bash
+xcindex watch                  # foreground; Ctrl+C to stop
+xcindex watch --debounce 1000  # wait 1s after the last event before prewarming
+```
+
+Run it in a terminal pane (or backgrounded with `nohup`). Single-instance per
+project — starting a second one fails fast. Resident footprint ~30MB; idle
+CPU ~0%. Status observable via:
+
+- `xcindex doctor` — `watcher` row reports `running (pid=…, since…)` + last
+  prewarm mode/duration. Escalates to WARN if >50% of recent prewarms fail.
+- `~/.cache/xcindex/<project>/watch.json` — full state (event/error counts,
+  timestamps, last error message).
+
+The watcher is resilient: if a `prewarm` subprocess errors, it logs +
+increments the error counter and **keeps running** — one failure doesn't
+take it down. State is cleaned on graceful exit (SIGINT/SIGTERM).
+
+Project-aware hooks (Tuist plugin auto-install, Build Phase script generation,
+scheme post-action injection) are planned as `xcindex profile` in a follow-up.
 
 ## Limitations
 
