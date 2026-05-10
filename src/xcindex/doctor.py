@@ -310,6 +310,102 @@ def check_helper_version() -> CheckResult:
     )
 
 
+def check_cache_warm(
+    cwd: Path | None = None,
+    *,
+    index_store_override: Path | None = None,
+    derived_data_override: Path | None = None,
+) -> CheckResult:
+    """Reports whether the SQLite cache is in sync with the IndexStore.
+
+    States:
+      - OK    cache exists, schema current, unit delta empty
+      - WARN  cache exists but is stale (units modified since last materialize)
+      - INFO  no cache yet (first query will bootstrap)
+      - INFO  no project / no IndexStore (skipped)
+      - ERROR cache schema outdated (run xcindex setup install)
+    """
+    try:
+        project = discovery.find_project(cwd)
+    except discovery.DiscoveryError:
+        return CheckResult(
+            name="cache-warm",
+            status=STATUS_INFO,
+            detail="skipped — no project discovered",
+            group=GROUP_CACHE,
+        )
+    try:
+        index_store = discovery.find_index_store(
+            project,
+            index_store_override=index_store_override,
+            derived_data_override=derived_data_override,
+        )
+    except discovery.DiscoveryError:
+        return CheckResult(
+            name="cache-warm",
+            status=STATUS_INFO,
+            detail="skipped — no IndexStore (build the project first)",
+            group=GROUP_CACHE,
+        )
+
+    sqlite_path = cache_module.canonical_sqlite_path(project.path)
+    if not sqlite_path.exists():
+        return CheckResult(
+            name="cache-warm",
+            status=STATUS_INFO,
+            detail="no cache yet (first query or `xcindex prewarm` will bootstrap)",
+            fix="run `xcindex prewarm` to materialize the cache up front",
+            group=GROUP_CACHE,
+        )
+
+    # Lazy imports to keep the doctor module light when only running other checks.
+    from xcindex import engine as engine_module
+    from xcindex import incremental as incremental_module
+
+    if engine_module._schema_outdated(sqlite_path):
+        return CheckResult(
+            name="cache-warm",
+            status=STATUS_ERROR,
+            detail="cache schema outdated",
+            fix="run `xcindex setup install` to rebuild the helper, then `xcindex prewarm`",
+            group=GROUP_CACHE,
+        )
+
+    try:
+        delta = incremental_module.compute_unit_delta(sqlite_path, index_store)
+    except Exception as exc:
+        return CheckResult(
+            name="cache-warm",
+            status=STATUS_WARN,
+            detail=f"could not read cache delta: {exc}",
+            fix="run `xcindex prewarm` to refresh",
+            group=GROUP_CACHE,
+        )
+
+    if delta.is_empty:
+        return CheckResult(
+            name="cache-warm",
+            status=STATUS_OK,
+            detail=f"in sync ({sqlite_path})",
+            group=GROUP_CACHE,
+        )
+
+    bits: list[str] = []
+    if delta.modified:
+        bits.append(f"{len(delta.modified)} modified")
+    if delta.removed:
+        bits.append(f"{len(delta.removed)} removed")
+    if delta.added:
+        bits.append(f"{len(delta.added)} added")
+    return CheckResult(
+        name="cache-warm",
+        status=STATUS_WARN,
+        detail=f"stale: {', '.join(bits)} unit(s)",
+        fix="run `xcindex prewarm` to refresh the cache",
+        group=GROUP_CACHE,
+    )
+
+
 def check_git_repo(cwd: Path | None = None) -> CheckResult:
     """Detect whether the working directory is inside a git repo and
     whether the `git` CLI is reachable. Required only by `xcindex git`."""
@@ -385,6 +481,11 @@ def run_all_checks(
         check_helper_version(),
         check_project(cwd),
         check_index_store(
+            cwd,
+            index_store_override=index_store_override,
+            derived_data_override=derived_data_override,
+        ),
+        check_cache_warm(
             cwd,
             index_store_override=index_store_override,
             derived_data_override=derived_data_override,

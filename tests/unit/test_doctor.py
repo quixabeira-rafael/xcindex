@@ -172,3 +172,131 @@ def test_run_all_checks_includes_git_check(tmp_path: Path):
     results = doctor.run_all_checks(tmp_path)
     names = {r.name for r in results}
     assert "git" in names
+
+
+# --- check_cache_warm -------------------------------------------------------
+
+def test_check_cache_warm_no_project_returns_info(tmp_path: Path):
+    result = doctor.check_cache_warm(tmp_path)
+    assert result.status == doctor.STATUS_INFO
+    assert "no project" in result.detail
+
+
+def test_check_cache_warm_no_index_store_returns_info(tmp_path: Path):
+    (tmp_path / "Package.swift").write_text("// stub\n")
+    result = doctor.check_cache_warm(tmp_path)
+    assert result.status == doctor.STATUS_INFO
+    assert "IndexStore" in result.detail or "skipped" in result.detail
+
+
+def test_check_cache_warm_no_cache_returns_info(tmp_path: Path, monkeypatch):
+    """SwiftPM project with built IndexStore but no SQLite cache yet."""
+    import xcindex.cache as cache_module_local
+    cache_dir = tmp_path / "xcache"
+    monkeypatch.setattr(cache_module_local, "CACHE_ROOT", cache_dir)
+
+    (tmp_path / "Package.swift").write_text("// stub\n")
+    units_dir = tmp_path / ".build" / "debug" / "index" / "store" / "v5" / "units"
+    units_dir.mkdir(parents=True)
+    (units_dir / "u1.unit").write_text("stub")
+
+    result = doctor.check_cache_warm(tmp_path)
+    assert result.status == doctor.STATUS_INFO
+    assert "no cache" in result.detail
+
+
+def test_check_cache_warm_in_sync_returns_ok(tmp_path: Path, monkeypatch):
+    """Cache exists, schema current, delta empty → OK."""
+    import xcindex.cache as cache_module_local
+    cache_dir = tmp_path / "xcache"
+    monkeypatch.setattr(cache_module_local, "CACHE_ROOT", cache_dir)
+
+    (tmp_path / "Package.swift").write_text("// stub\n")
+    units_dir = tmp_path / ".build" / "debug" / "index" / "store" / "v5" / "units"
+    units_dir.mkdir(parents=True)
+    (units_dir / "u1.unit").write_text("stub")
+
+    sqlite_path = cache_module_local.canonical_sqlite_path(tmp_path / "Package.swift")
+    sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+    sqlite_path.write_bytes(b"stub-sqlite")
+
+    # Patch internal helpers so we don't actually open SQLite
+    from xcindex import engine as engine_module
+    from xcindex import incremental as incremental_module
+
+    class _EmptyDelta:
+        modified: set[str] = set()
+        removed: set[str] = set()
+        added: set[str] = set()
+        is_empty = True
+
+    monkeypatch.setattr(engine_module, "_schema_outdated", lambda path: False)
+    monkeypatch.setattr(incremental_module, "compute_unit_delta",
+                        lambda sqlite, store: _EmptyDelta())
+
+    result = doctor.check_cache_warm(tmp_path)
+    assert result.status == doctor.STATUS_OK
+    assert "in sync" in result.detail
+
+
+def test_check_cache_warm_drift_returns_warn(tmp_path: Path, monkeypatch):
+    """Cache exists, schema current, but unit delta is non-empty → WARN."""
+    import xcindex.cache as cache_module_local
+    cache_dir = tmp_path / "xcache"
+    monkeypatch.setattr(cache_module_local, "CACHE_ROOT", cache_dir)
+
+    (tmp_path / "Package.swift").write_text("// stub\n")
+    units_dir = tmp_path / ".build" / "debug" / "index" / "store" / "v5" / "units"
+    units_dir.mkdir(parents=True)
+    (units_dir / "u1.unit").write_text("stub")
+
+    sqlite_path = cache_module_local.canonical_sqlite_path(tmp_path / "Package.swift")
+    sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+    sqlite_path.write_bytes(b"stub-sqlite")
+
+    from xcindex import engine as engine_module
+    from xcindex import incremental as incremental_module
+
+    class _DriftDelta:
+        modified = {"u1.unit", "u2.unit"}
+        removed: set[str] = set()
+        added: set[str] = set()
+        is_empty = False
+
+    monkeypatch.setattr(engine_module, "_schema_outdated", lambda path: False)
+    monkeypatch.setattr(incremental_module, "compute_unit_delta",
+                        lambda sqlite, store: _DriftDelta())
+
+    result = doctor.check_cache_warm(tmp_path)
+    assert result.status == doctor.STATUS_WARN
+    assert "2 modified" in result.detail
+    assert result.fix is not None and "prewarm" in result.fix
+
+
+def test_check_cache_warm_schema_outdated_returns_error(tmp_path: Path, monkeypatch):
+    import xcindex.cache as cache_module_local
+    cache_dir = tmp_path / "xcache"
+    monkeypatch.setattr(cache_module_local, "CACHE_ROOT", cache_dir)
+
+    (tmp_path / "Package.swift").write_text("// stub\n")
+    units_dir = tmp_path / ".build" / "debug" / "index" / "store" / "v5" / "units"
+    units_dir.mkdir(parents=True)
+    (units_dir / "u1.unit").write_text("stub")
+
+    sqlite_path = cache_module_local.canonical_sqlite_path(tmp_path / "Package.swift")
+    sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+    sqlite_path.write_bytes(b"old-stub")
+
+    from xcindex import engine as engine_module
+    monkeypatch.setattr(engine_module, "_schema_outdated", lambda path: True)
+
+    result = doctor.check_cache_warm(tmp_path)
+    assert result.status == doctor.STATUS_ERROR
+    assert "schema" in result.detail.lower()
+
+
+def test_run_all_checks_includes_cache_warm(tmp_path: Path):
+    (tmp_path / ".git").mkdir()
+    results = doctor.run_all_checks(tmp_path)
+    names = {r.name for r in results}
+    assert "cache-warm" in names
