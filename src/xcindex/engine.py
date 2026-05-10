@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import sqlite3
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
@@ -25,6 +26,30 @@ class ProjectContext:
     is_stale: bool = False
 
 
+@dataclass(frozen=True)
+class MaterializationResult:
+    """Outcome of a single materialize() call.
+
+    `mode` is one of:
+      - "cold"           — no cache existed (or new units detected); ran a full bootstrap.
+      - "schema_upgrade" — cache existed but schema was outdated; ran a full re-bootstrap.
+      - "incremental"    — cache existed; processed delta of modified/removed units.
+      - "noop"           — cache up to date; no work performed.
+    """
+    mode: str
+    project: discovery.ProjectInfo
+    index_store: Path
+    sqlite_path: Path
+    index_hash: str
+    wall_seconds: float
+    symbols_added: int = 0
+    occurrences_added: int = 0
+    relations_added: int = 0
+    units_modified: int = 0
+    units_removed: int = 0
+    units_added: int = 0
+
+
 class EngineError(Exception):
     """Raised when the engine cannot prepare a usable SQLite cache."""
 
@@ -33,8 +58,17 @@ class StaleIndexError(EngineError):
     """Raised when --require-fresh detects the IndexStore is older than source files."""
 
 
-def add_project_arguments(parser: argparse.ArgumentParser) -> None:
-    """Attach the standard project/index/derived-data overrides to a subcommand."""
+def add_project_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    include_freshness_flags: bool = True,
+) -> None:
+    """Attach the standard project/index/derived-data overrides to a subcommand.
+
+    `include_freshness_flags=False` skips `--check-fresh` and `--require-fresh`.
+    Use this for commands like `prewarm` where freshness checks don't apply
+    (since the command itself IS the freshness operation).
+    """
     parser.add_argument("--project", type=Path, default=None,
                         help="Path to .xcodeproj/.xcworkspace/Package.swift (overrides discovery).")
     parser.add_argument("--index-store", type=Path, default=None,
@@ -43,11 +77,12 @@ def add_project_arguments(parser: argparse.ArgumentParser) -> None:
                         help="Path to DerivedData root (overrides default).")
     parser.add_argument("--include-system", action="store_true",
                         help="Include SDK / system symbols in the dump (default: false).")
-    parser.add_argument("--check-fresh", action="store_true",
-                        help="Walk the project tree to detect source files newer than the index "
-                             "(emits a warning if stale; default: skipped on large projects).")
-    parser.add_argument("--require-fresh", action="store_true",
-                        help="Like --check-fresh, but fails with EXIT_STALE_INDEX instead of warning.")
+    if include_freshness_flags:
+        parser.add_argument("--check-fresh", action="store_true",
+                            help="Walk the project tree to detect source files newer than the index "
+                                 "(emits a warning if stale; default: skipped on large projects).")
+        parser.add_argument("--require-fresh", action="store_true",
+                            help="Like --check-fresh, but fails with EXIT_STALE_INDEX instead of warning.")
 
 
 def resolve_project(args: argparse.Namespace) -> discovery.ProjectInfo:
@@ -68,17 +103,22 @@ def resolve_index_store(
     )
 
 
-@contextlib.contextmanager
-def open_context(
+def materialize(
     args: argparse.Namespace,
     *,
     allow_build: bool = True,
-) -> Iterator[tuple[ProjectContext, sqlite3.Connection]]:
-    """Resolve project, ensure cache is fresh, yield (context, sqlite connection).
+) -> MaterializationResult:
+    """Resolve project + IndexStore, ensure SQLite cache is up-to-date, return stats.
 
-    On cache miss this spawns the helper to materialize the SQLite. On cache hit
-    it just opens the existing file.
+    Does NOT open a query connection. Idempotent: a second consecutive call with
+    no changes returns mode="noop". Concurrency-safe via `cache_module.acquire_lock`.
+
+    `allow_build=False` skips the helper rebuild step (raises HelperError if the
+    helper binary is missing). Useful in hot paths where the caller doesn't want
+    to pay the ~60s build cost.
     """
+    start = time.monotonic()
+
     try:
         project = resolve_project(args)
     except discovery.DiscoveryError as exc:
@@ -100,6 +140,15 @@ def open_context(
         swift_version=helper_info.swift_version,
         helper_version=helper_info.helper_version,
     )
+    include_system = getattr(args, "include_system", False)
+
+    mode = "noop"
+    symbols_added = 0
+    occurrences_added = 0
+    relations_added = 0
+    units_modified = 0
+    units_removed = 0
+    units_added = 0
 
     with cache_module.acquire_lock(project.path):
         # Rename any pre-canonical-name caches to `legacy_*.sqlite` before
@@ -114,84 +163,136 @@ def open_context(
 
         from xcindex import incremental as incremental_module
 
-        needs_bootstrap = not sqlite_path.exists() or _schema_outdated(sqlite_path)
+        cache_existed_before = sqlite_path.exists()
+        needs_bootstrap = not cache_existed_before or _schema_outdated(sqlite_path)
         if needs_bootstrap:
-            if sqlite_path.exists():
+            mode = "schema_upgrade" if cache_existed_before else "cold"
+            if cache_existed_before:
                 sqlite_path.unlink()
-            _materialize(
+            result = _materialize(
                 project=project,
                 index_store=index_store,
                 sqlite_path=sqlite_path,
                 index_hash=index_hash,
                 helper_info=helper_info,
                 helper_binary=helper_binary,
-                include_system=getattr(args, "include_system", False),
+                include_system=include_system,
             )
+            symbols_added = result.symbols
+            occurrences_added = result.occurrences
+            relations_added = result.relations
             cache_module.gc_caches(project.path)
             cache_module.write_meta(project.path, latest_hash=index_hash)
         else:
             delta = incremental_module.compute_unit_delta(sqlite_path, index_store)
             if delta.needs_full_redump:
                 # New units (added source files) — fall back to full re-dump.
+                mode = "cold"
+                units_added = len(delta.added)
                 sys.stderr.write(
-                    f"xcindex: {len(delta.added)} new unit(s) detected; "
+                    f"xcindex: {units_added} new unit(s) detected; "
                     "running full re-dump (incremental cannot infer their files yet).\n"
                 )
                 sqlite_path.unlink()
-                _materialize(
+                result = _materialize(
                     project=project,
                     index_store=index_store,
                     sqlite_path=sqlite_path,
                     index_hash=index_hash,
                     helper_info=helper_info,
                     helper_binary=helper_binary,
-                    include_system=getattr(args, "include_system", False),
+                    include_system=include_system,
                 )
+                symbols_added = result.symbols
+                occurrences_added = result.occurrences
+                relations_added = result.relations
                 cache_module.gc_caches(project.path)
                 cache_module.write_meta(project.path, latest_hash=index_hash)
             elif not delta.is_empty:
+                units_modified = len(delta.modified)
+                units_removed = len(delta.removed)
                 try:
                     stats = helper_module.run_incremental(
                         index_store_path=index_store,
                         sqlite_path=sqlite_path,
                         modified_units=sorted(delta.modified),
                         removed_units=sorted(delta.removed),
-                        include_system=getattr(args, "include_system", False),
+                        include_system=include_system,
                         helper_path=helper_binary,
                     )
                 except helper_module.StaleSchemaError:
                     # Cache schema lags behind the helper — tear down and bootstrap fresh.
+                    mode = "schema_upgrade"
+                    units_modified = 0
+                    units_removed = 0
                     sys.stderr.write(
                         "xcindex: cache schema mismatch; running full re-bootstrap.\n"
                     )
                     sqlite_path.unlink()
-                    _materialize(
+                    result = _materialize(
                         project=project,
                         index_store=index_store,
                         sqlite_path=sqlite_path,
                         index_hash=index_hash,
                         helper_info=helper_info,
                         helper_binary=helper_binary,
-                        include_system=getattr(args, "include_system", False),
+                        include_system=include_system,
                     )
+                    symbols_added = result.symbols
+                    occurrences_added = result.occurrences
+                    relations_added = result.relations
                     cache_module.gc_caches(project.path)
                     cache_module.write_meta(project.path, latest_hash=index_hash)
                 else:
+                    mode = "incremental"
+                    symbols_added = stats.symbols
+                    occurrences_added = stats.occurrences
+                    relations_added = stats.relations
                     sys.stderr.write(
                         f"xcindex: incremental update — "
-                        f"modified {len(delta.modified)}, removed {len(delta.removed)} unit(s); "
+                        f"modified {units_modified}, removed {units_removed} unit(s); "
                         f"+{stats.symbols} symbols, +{stats.occurrences} occurrences, "
                         f"+{stats.relations} relations ({stats.wall_seconds:.1f}s).\n"
                     )
                     cache_module.write_meta(project.path, latest_hash=index_hash)
-            # else: cache hit, no work needed
+            # else: cache hit, mode stays "noop"
+
+    return MaterializationResult(
+        mode=mode,
+        project=project,
+        index_store=index_store,
+        sqlite_path=sqlite_path,
+        index_hash=index_hash,
+        wall_seconds=time.monotonic() - start,
+        symbols_added=symbols_added,
+        occurrences_added=occurrences_added,
+        relations_added=relations_added,
+        units_modified=units_modified,
+        units_removed=units_removed,
+        units_added=units_added,
+    )
+
+
+@contextlib.contextmanager
+def open_context(
+    args: argparse.Namespace,
+    *,
+    allow_build: bool = True,
+) -> Iterator[tuple[ProjectContext, sqlite3.Connection]]:
+    """Resolve project, ensure cache is fresh, yield (context, sqlite connection).
+
+    Materialization is delegated to `materialize()`; this wrapper adds the
+    staleness check (when --check-fresh / --require-fresh are set) and opens
+    a read-only SQLite connection for queries.
+    """
+    result = materialize(args, allow_build=allow_build)
 
     warnings: list[str] = []
     is_stale = False
     require_fresh = getattr(args, "require_fresh", False)
     check_fresh = getattr(args, "check_fresh", False)
     if require_fresh or check_fresh:
-        staleness = _detect_staleness(project, index_store)
+        staleness = _detect_staleness(result.project, result.index_store)
         if staleness is not None:
             is_stale = True
             warnings.append(staleness)
@@ -199,14 +300,14 @@ def open_context(
                 raise StaleIndexError(staleness)
 
     context = ProjectContext(
-        project=project,
-        index_store=index_store,
-        sqlite_path=sqlite_path,
-        index_hash=index_hash,
+        project=result.project,
+        index_store=result.index_store,
+        sqlite_path=result.sqlite_path,
+        index_hash=result.index_hash,
         warnings=tuple(warnings),
         is_stale=is_stale,
     )
-    conn = query_module.open_readonly(sqlite_path)
+    conn = query_module.open_readonly(result.sqlite_path)
     try:
         yield context, conn
     finally:
