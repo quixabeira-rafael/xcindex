@@ -46,7 +46,8 @@ when Xcode rebuilds (different hash → fresh dump).
 |-----------------|--------------------------------------------------------|
 | `setup install` | Validate toolchain and build the Swift helper          |
 | `setup uninstall` | Remove helper binary and SQLite caches               |
-| `doctor`        | Health check (system + toolchain + project/IndexStore + git checks) |
+| `doctor`        | Health check (system + toolchain + project/IndexStore + cache-warm + git checks) |
+| `prewarm`       | Materialize the SQLite cache from the IndexStore (cold/incremental/noop). Wire into a build hook to keep query latency warm. |
 | `cache list`    | List cached SQLite files                               |
 | `cache clear`   | Remove cached SQLite files                             |
 | `search NAME`   | Substring search by symbol name (case-insensitive)     |
@@ -189,6 +190,52 @@ Pre-v3 caches (`schema_version != 3`) are detected and rebuilt on first
 invocation. v1/v2 `<hash>.sqlite` snapshots from earlier versions are
 preserved as `legacy_<hash>.sqlite` for forensics; up to three are kept,
 then GC'd.
+
+## Keeping the cache warm (`xcindex prewarm`)
+
+By default the cache is materialized **lazily on the first query**. On a large
+workspace that means the user pays ~15–30s on the next `xcindex` invocation
+after each rebuild. `xcindex prewarm` is the same dispatch (cold / incremental
+/ noop) extracted as a one-shot command — wire it into your build pipeline so
+the cost is paid in the background and queries stay <50ms warm.
+
+```bash
+xcindex prewarm                # default text output
+xcindex prewarm --quiet        # silent on no-op (useful in hooks)
+xcindex prewarm --format json  # programmatic
+```
+
+Output modes:
+
+- **cold**: `bootstrapped: 340000 symbols, 1.2M occurrences, 1.5M relations (15.2s)`
+- **incremental**: `incremental: 3 modified, 0 removed (+12 symbols, +45 occurrences, +30 relations) (0.8s)`
+- **noop**: `cache up to date (0.0s)` (suppressed under `--quiet`)
+- **schema_upgrade**: `schema upgraded; full re-bootstrap (15.2s)`
+
+`xcindex doctor` includes a `cache-warm` check that reports whether the cache
+is in sync with the IndexStore (`OK`), drifted (`WARN`), or absent (`INFO`).
+
+`prewarm` always exits 0 on success regardless of which mode ran. For
+hooks that want fail-fast on missing helper, pass `--no-build-helper`.
+
+The materialization function is also exposed as a public Python API:
+
+```python
+from xcindex import materialize, MaterializationResult
+result = materialize(args)
+print(result.mode, result.wall_seconds)
+```
+
+Hooks for triggering `prewarm` (Build Phase scripts, scheme post-actions,
+Tuist plugins, watchers) are not yet packaged — that is planned as a
+follow-up `xcindex profile` feature. For now a project-specific shell
+alias around `xcodebuild` is the simplest integration:
+
+```bash
+# ~/.zshrc
+xcb_with_prewarm() { command xcodebuild "$@" && command xcindex prewarm --quiet 2>/dev/null; }
+alias xcodebuild=xcb_with_prewarm
+```
 
 ## Limitations
 

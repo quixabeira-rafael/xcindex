@@ -18,6 +18,7 @@ The four daily-driver commands have rich workflows below. Everything else is a p
 | **`file`** | ✅ inventory a file | this skill, "Workflow C" |
 | **`search`** | ✅ locate a symbol by name | this skill, "Workflow D" |
 | `at`, `containing`, `symbol`, `occurrences`, `relations`, `neighbors`, `reach` | primitives | run `xcindex <cmd> --help` |
+| `prewarm` | wire into build hooks to keep cache warm | this skill, "Workflow E" |
 | `cache`, `doctor`, `setup`, `skill` | infra | run `xcindex <cmd> --help` |
 
 If the question maps cleanly to one of the four primary commands, use it. The primitives still exist for power-user queries (e.g. role-filtered occurrences, hand-tuned reach traversals) — fall through to `--help` when the daily commands aren't enough.
@@ -28,7 +29,7 @@ Six facts that change how you should call xcindex:
 
 1. **xcindex queries the IndexStore, never the live source.** The compiler writes the IndexStore as a side effect of every build. If the project hasn't been rebuilt since a code change, queries reflect the *previous* build state. After editing source, rebuild before drawing conclusions. Add `--check-fresh` to surface a warning, or `--require-fresh` to fail with exit 4.
 
-2. **First query bootstraps a per-project SQLite cache.** Cold dump on a large iOS workspace is ~15–30s; subsequent queries are <500ms. The cache lives at `~/.cache/xcindex/<project_fingerprint>/index.sqlite` and is keyed by absolute project path. Don't kill the first query — it's not stuck, it's bootstrapping.
+2. **First query bootstraps a per-project SQLite cache.** Cold dump on a large iOS workspace is ~15–30s; subsequent queries are <500ms. The cache lives at `~/.cache/xcindex/<project_fingerprint>/index.sqlite` and is keyed by absolute project path. Don't kill the first query — it's not stuck, it's bootstrapping. To pay this cost in the background instead, see `xcindex prewarm` (Workflow E).
 
 3. **Cache invalidation is per-unit, mtime + size.** Edit one file, rebuild, the next query runs an incremental update (~1s). New source files fall back to a full re-bootstrap. Tuist `tuist generate` rewrites every unit, so it forces a cold dump too.
 
@@ -170,6 +171,42 @@ Filters:
 - You need a population estimate ("how many `setUp` methods exist?").
 
 When the user gives an exact name and there's likely one match, prefer `xcindex symbol --name <name>` (use `xcindex symbol --help`) — it returns immediately without substring noise.
+
+## Workflow E — keep the cache warm (`xcindex prewarm`)
+
+The cold dump (~15–30s) is paid lazily on the first query unless you trigger it explicitly. `xcindex prewarm` runs the same dispatch (cold / incremental / noop) as a one-shot command; wiring it into a build hook eliminates user-visible cold start.
+
+```bash
+xcindex prewarm                # default text output
+xcindex prewarm --quiet        # silent on noop (good for hooks)
+xcindex prewarm --format json  # programmatic
+```
+
+Modes the command may report:
+- **cold** — first run or new units detected (Tuist regen, new source file).
+- **incremental** — units modified since last call (~1s).
+- **noop** — cache already in sync.
+- **schema_upgrade** — helper bumped schema; full re-bootstrap.
+
+Always exits 0 on success. `--no-build-helper` makes it fail fast if the helper binary is missing instead of rebuilding (useful when called inside a build phase where the rebuild cost is unwanted).
+
+Doctor reports whether the cache is in sync via the `cache-warm` check (`OK` / `WARN: N units stale` / `INFO: no cache yet`).
+
+The materialization function is a public Python API too:
+```python
+from xcindex import materialize, MaterializationResult
+result = materialize(args)
+print(result.mode, result.wall_seconds, result.symbols_added)
+```
+
+A typical hook (no daemon, no project file modification):
+```bash
+# ~/.zshrc
+xcb_with_prewarm() { command xcodebuild "$@" && command xcindex prewarm --quiet 2>/dev/null; }
+alias xcodebuild=xcb_with_prewarm
+```
+
+Project-specific hooks (Tuist plugin, scheme post-action, Build Phase) are not yet packaged — that's planned as `xcindex profile` in a follow-up. For now, recommend the alias above when the user asks for "auto" cache warming.
 
 ## Everything else: read `--help`
 
