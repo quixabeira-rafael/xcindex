@@ -140,6 +140,101 @@ def list_caches(project_path: Path | None = None) -> list[CacheEntry]:
     return entries
 
 
+@dataclass(frozen=True)
+class GCCandidate:
+    """A cache directory observed by gc_idle_caches()."""
+    project_fingerprint: str
+    project_path: Path | None       # None if no project_path was recorded in meta
+    cache_dir: Path
+    sqlite_mtime_ns: int
+    idle_seconds: float
+    size_bytes: int
+
+
+@dataclass(frozen=True)
+class GCResult:
+    """Outcome of one `cache gc` pass."""
+    pruned: list[GCCandidate]
+    kept: list[GCCandidate]
+    bytes_freed: int
+    threshold_seconds: int
+    dry_run: bool
+
+
+def gc_idle_caches(
+    *,
+    max_idle_seconds: int = 3600,
+    dry_run: bool = False,
+) -> GCResult:
+    """Remove caches whose live `index.sqlite` has not been touched recently.
+
+    A cache is eligible when:
+      `time.time() - mtime(index.sqlite) > max_idle_seconds`
+
+    Mtime is updated by every cold/incremental materialize() (and by the
+    helper's atomic-rename pattern). Read-only queries do NOT update mtime,
+    so a cache with stale mtime means "no build/incremental activity for
+    `max_idle_seconds`". Empty cache directories without a live sqlite are
+    also treated as ancient (no live data worth keeping).
+    """
+    pruned: list[GCCandidate] = []
+    kept: list[GCCandidate] = []
+    bytes_freed = 0
+    now = time.time()
+
+    if not CACHE_ROOT.exists():
+        return GCResult(pruned=[], kept=[], bytes_freed=0,
+                        threshold_seconds=max_idle_seconds, dry_run=dry_run)
+
+    for directory in CACHE_ROOT.iterdir():
+        if not directory.is_dir():
+            continue
+
+        live_sqlite = directory / LIVE_SQLITE_NAME
+        meta = _read_meta(directory)
+        recorded_path = meta.get("project_path")
+        proj_path: Path | None = Path(recorded_path) if recorded_path else None
+
+        try:
+            mtime_ns = live_sqlite.stat().st_mtime_ns
+        except FileNotFoundError:
+            mtime_ns = 0  # no live sqlite — treat as ancient
+        except OSError:
+            continue
+
+        idle_seconds = now - (mtime_ns / 1_000_000_000)
+
+        try:
+            size = sum(f.stat().st_size for f in directory.rglob("*") if f.is_file())
+        except OSError:
+            size = 0
+
+        candidate = GCCandidate(
+            project_fingerprint=directory.name,
+            project_path=proj_path,
+            cache_dir=directory,
+            sqlite_mtime_ns=mtime_ns,
+            idle_seconds=idle_seconds,
+            size_bytes=size,
+        )
+
+        if idle_seconds > max_idle_seconds:
+            pruned.append(candidate)
+            bytes_freed += size
+            if not dry_run:
+                try:
+                    shutil.rmtree(directory)
+                except OSError:
+                    pass
+        else:
+            kept.append(candidate)
+
+    return GCResult(
+        pruned=pruned, kept=kept, bytes_freed=bytes_freed,
+        threshold_seconds=max_idle_seconds, dry_run=dry_run,
+    )
+
+
 def clear_caches(project_path: Path | None = None, *, all_projects: bool = False) -> int:
     """Remove cached SQLite files. Returns count of files removed.
 

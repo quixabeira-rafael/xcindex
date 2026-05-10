@@ -39,6 +39,16 @@ def register(subparsers) -> None:
                               help="Project to clear (default: discovered project).")
     clear_parser.set_defaults(func=cmd_cache_clear)
 
+    gc_parser = sub.add_parser("gc",
+                               help="Garbage-collect caches idle for >N minutes.")
+    gc_parser.add_argument("--json", dest="json_mode", action="store_true",
+                           help="Emit results as JSON.")
+    gc_parser.add_argument("--dry-run", action="store_true",
+                           help="List candidates without removing anything.")
+    gc_parser.add_argument("--max-idle", dest="max_idle_minutes", type=int, default=60,
+                           help="Idle threshold in minutes (default: 60).")
+    gc_parser.set_defaults(func=cmd_cache_gc)
+
     parser.set_defaults(func=lambda args: _print_help(parser))
 
 
@@ -109,6 +119,73 @@ def cmd_cache_clear(args: argparse.Namespace) -> int:
     removed = cache_module.clear_caches(project_path)
     _emit_clear_result(args, removed=removed, scope=str(project_path))
     return EXIT_OK
+
+
+def cmd_cache_gc(args: argparse.Namespace) -> int:
+    max_idle_seconds = args.max_idle_minutes * 60
+    result = cache_module.gc_idle_caches(
+        max_idle_seconds=max_idle_seconds,
+        dry_run=args.dry_run,
+    )
+
+    if args.json_mode:
+        emit_json({
+            "kind": "cache_gc",
+            "anchor": {
+                "threshold_minutes": args.max_idle_minutes,
+                "dry_run": args.dry_run,
+            },
+            "summary": {
+                "pruned_count": len(result.pruned),
+                "kept_count": len(result.kept),
+                "bytes_freed": result.bytes_freed,
+            },
+            "items": [
+                {
+                    "fingerprint": c.project_fingerprint,
+                    "project_path": str(c.project_path) if c.project_path else None,
+                    "cache_dir": str(c.cache_dir),
+                    "idle_seconds": int(c.idle_seconds),
+                    "size_bytes": c.size_bytes,
+                    "action": "pruned" if c in result.pruned else "kept",
+                }
+                for c in (*result.pruned, *result.kept)
+            ],
+        })
+        return EXIT_OK
+
+    verb = "would remove" if args.dry_run else "removed"
+    if not result.pruned:
+        emit_text(f"no caches idle > {args.max_idle_minutes} minutes "
+                  f"({len(result.kept)} kept, {_format_size(sum(c.size_bytes for c in result.kept))} total)")
+        return EXIT_OK
+
+    lines = [
+        f"{verb} {len(result.pruned)} cache(s), {_format_size(result.bytes_freed)} freed (idle > {args.max_idle_minutes} min):",
+    ]
+    for cand in result.pruned:
+        idle_label = _format_idle(cand.idle_seconds)
+        path_label = str(cand.project_path) if cand.project_path else "(no project_path recorded)"
+        lines.append(f"  {cand.project_fingerprint} — {path_label} (idle {idle_label})")
+    if result.kept:
+        lines.append(
+            f"kept {len(result.kept)} active cache(s), "
+            f"{_format_size(sum(c.size_bytes for c in result.kept))} total"
+        )
+    emit_text("\n".join(lines))
+    return EXIT_OK
+
+
+def _format_idle(seconds: float) -> str:
+    if seconds < 90:
+        return f"{int(seconds)}s"
+    minutes = seconds / 60
+    if minutes < 90:
+        return f"{int(minutes)}m"
+    hours = minutes / 60
+    if hours < 48:
+        return f"{int(hours)}h {int(minutes - hours * 60)}m"
+    return f"{int(hours / 24)}d"
 
 
 def _emit_clear_result(args: argparse.Namespace, *, removed: int, scope: str) -> None:
