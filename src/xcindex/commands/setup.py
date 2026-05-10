@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from xcindex import cache as cache_module
+from xcindex import claude_hooks
 from xcindex import claude_skill
 from xcindex import doctor as doctor_module
 from xcindex import helper as helper_module
@@ -36,6 +37,38 @@ def register(subparsers) -> None:
     uninstall.add_argument("--json", dest="json_mode", action="store_true",
                            help="Emit results as JSON.")
     uninstall.set_defaults(func=cmd_uninstall)
+
+    hooks = sub.add_parser("hooks", help="Manage Claude Code session hooks.")
+    hooks_sub = hooks.add_subparsers(dest="hooks_command", metavar="ACTION")
+    hooks_install = hooks_sub.add_parser(
+        "install",
+        help="Install xcindex SessionStart/SessionEnd/SubagentStop hooks.",
+        description=(
+            "Append xcindex auto-hooks into ~/.claude/settings.json. "
+            "Idempotent: existing managed entries are refreshed. "
+            "Other (non-xcindex) hooks are preserved."
+        ),
+    )
+    hooks_install.add_argument("--json", dest="json_mode", action="store_true",
+                               help="Emit results as JSON.")
+    hooks_install.set_defaults(func=cmd_hooks_install)
+
+    hooks_uninstall = hooks_sub.add_parser(
+        "uninstall",
+        help="Remove xcindex-managed entries from ~/.claude/settings.json.",
+    )
+    hooks_uninstall.add_argument("--json", dest="json_mode", action="store_true",
+                                 help="Emit results as JSON.")
+    hooks_uninstall.set_defaults(func=cmd_hooks_uninstall)
+
+    hooks_status = hooks_sub.add_parser(
+        "status", help="Show which xcindex hooks are currently installed.",
+    )
+    hooks_status.add_argument("--json", dest="json_mode", action="store_true",
+                              help="Emit results as JSON.")
+    hooks_status.set_defaults(func=cmd_hooks_status)
+
+    hooks.set_defaults(func=lambda args: _print_help(hooks))
 
     parser.set_defaults(func=lambda args: _print_help(parser))
 
@@ -135,6 +168,82 @@ def _resolve_skill_choice(args: argparse.Namespace) -> bool:
     except EOFError:
         return False
     return response in ("", "y", "yes")
+
+
+def cmd_hooks_install(args: argparse.Namespace) -> int:
+    try:
+        result = claude_hooks.install()
+    except RuntimeError as exc:
+        if args.json_mode:
+            emit_json({"error": "invalid_settings", "message": str(exc)})
+        else:
+            emit_text(f"error: {exc}")
+        return EXIT_INVALID_STATE
+
+    payload = {
+        "settings_path": str(result.settings_path),
+        "added": result.added,
+        "refreshed": result.refreshed,
+        "skipped_no_claude_dir": result.skipped_no_claude_dir,
+    }
+    if args.json_mode:
+        emit_json(payload)
+        return EXIT_OK
+
+    if result.skipped_no_claude_dir:
+        emit_text("skipped: ~/.claude not present (Claude Code not installed)")
+        return EXIT_OK
+    if result.added:
+        emit_text(f"installed: {', '.join(result.added)}")
+    if result.refreshed:
+        emit_text(f"refreshed (already present): {', '.join(result.refreshed)}")
+    emit_text(f"settings: {result.settings_path}")
+    return EXIT_OK
+
+
+def cmd_hooks_uninstall(args: argparse.Namespace) -> int:
+    try:
+        result = claude_hooks.uninstall()
+    except RuntimeError as exc:
+        if args.json_mode:
+            emit_json({"error": "invalid_settings", "message": str(exc)})
+        else:
+            emit_text(f"error: {exc}")
+        return EXIT_INVALID_STATE
+
+    payload = {
+        "settings_path": str(result.settings_path),
+        "removed": result.removed,
+        "not_found": result.not_found,
+    }
+    if args.json_mode:
+        emit_json(payload)
+        return EXIT_OK
+
+    if result.removed:
+        emit_text(f"removed: {', '.join(result.removed)}")
+    if result.not_found:
+        emit_text(f"not present: {', '.join(result.not_found)}")
+    emit_text(f"settings: {result.settings_path}")
+    return EXIT_OK
+
+
+def cmd_hooks_status(args: argparse.Namespace) -> int:
+    state = claude_hooks.status()
+    payload = {
+        "settings_path": str(state.settings_path),
+        "settings_exists": state.settings_exists,
+        "installed": state.installed,
+    }
+    if args.json_mode:
+        emit_json(payload)
+        return EXIT_OK
+
+    emit_text(f"settings: {state.settings_path} (exists: {state.settings_exists})")
+    for event, present in state.installed.items():
+        marker = "[OK]" if present else "[--]"
+        emit_text(f"  {marker} {event}")
+    return EXIT_OK
 
 
 def cmd_uninstall(args: argparse.Namespace) -> int:
