@@ -109,6 +109,9 @@ def project(canonical: dict[str, Any], level: str) -> dict[str, Any]:
         if level in ("locations", "detailed"):
             out["files"] = list(canonical.get("files") or [])
         return _strip_empty(out)
+    if canonical.get("kind") == "prewarm":
+        # All useful info lives in `summary` already; no items/stacks/files.
+        return _strip_empty(out)
     if level == "summary":
         return _strip_empty(out)
 
@@ -219,6 +222,8 @@ def _render_agent(projected: dict[str, Any]) -> str:
         return _render_impact_agent(projected)
     if projected.get("kind") == "git":
         return _render_git_agent(projected)
+    if projected.get("kind") == "prewarm":
+        return _render_prewarm_agent(projected)
 
     parts: list[str] = []
     kind = projected.get("kind")
@@ -431,6 +436,39 @@ def _format_summary_value(value: Any) -> str:
     if isinstance(value, list):
         return ", ".join(str(v) for v in value)
     return str(value)
+
+
+# --- Internal: prewarm renderer --------------------------------------------------
+
+
+def _render_prewarm_agent(projected: dict[str, Any]) -> str:
+    summary = projected.get("summary") or {}
+    anchor = projected.get("anchor") or {}
+    mode = summary.get("mode", "noop")
+    seconds = summary.get("wall_seconds", 0.0)
+    parts = [f"## prewarm — {mode} ({seconds:.1f}s)"]
+    project = anchor.get("project")
+    if project:
+        parts.append(f"  project: {project}")
+    if mode in ("cold", "schema_upgrade"):
+        parts.append(
+            f"  bootstrapped: {summary.get('symbols_added', 0)} symbols, "
+            f"{summary.get('occurrences_added', 0)} occurrences, "
+            f"{summary.get('relations_added', 0)} relations"
+        )
+        if summary.get("units_added"):
+            parts.append(f"  trigger: {summary['units_added']} new unit(s)")
+    elif mode == "incremental":
+        parts.append(
+            f"  modified: {summary.get('units_modified', 0)} unit(s), "
+            f"removed: {summary.get('units_removed', 0)} unit(s)"
+        )
+        parts.append(
+            f"  delta: +{summary.get('symbols_added', 0)} symbols, "
+            f"+{summary.get('occurrences_added', 0)} occurrences, "
+            f"+{summary.get('relations_added', 0)} relations"
+        )
+    return "\n".join(parts)
 
 
 # --- Internal: git renderer ------------------------------------------------------

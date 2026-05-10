@@ -14,6 +14,7 @@ from xcindex.commands import git as git_commands
 from xcindex.commands import impact as impact_commands
 from xcindex.commands import neighbors as neighbors_commands
 from xcindex.commands import occurrences as occurrences_commands
+from xcindex.commands import prewarm as prewarm_commands
 from xcindex.commands import reach as reach_commands
 from xcindex.commands import relations as relations_commands
 from xcindex.commands import search as search_commands
@@ -35,6 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     skill_commands.register(subparsers)
     doctor_commands.register(subparsers)
     cache_commands.register(subparsers)
+    prewarm_commands.register(subparsers)
     at_commands.register(subparsers)
     containing_commands.register(subparsers)
     file_commands.register(subparsers)
