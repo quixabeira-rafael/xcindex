@@ -406,6 +406,74 @@ def check_cache_warm(
     )
 
 
+def check_watcher_status(cwd: Path | None = None) -> CheckResult:
+    """Reports whether `xcindex watch` is running for the current project.
+
+    States:
+      - INFO   no watcher running (and no stale state)
+      - INFO   skipped — no project discovered
+      - OK     watcher running, recent prewarms healthy
+      - WARN   watcher running but >50% of recent prewarms failed
+      - ERROR  state file present but pid is dead (stale)
+    """
+    try:
+        project = discovery.find_project(cwd)
+    except discovery.DiscoveryError:
+        return CheckResult(
+            name="watcher",
+            status=STATUS_INFO,
+            detail="skipped — no project discovered",
+            group=GROUP_PROJECT,
+        )
+
+    from xcindex import watch as watch_module
+
+    state = watch_module.read_state(project.path)
+    if state is None:
+        return CheckResult(
+            name="watcher",
+            status=STATUS_INFO,
+            detail="no watcher running",
+            fix="run `xcindex watch` in a terminal pane to keep the cache fresh after each build",
+            group=GROUP_PROJECT,
+        )
+
+    if not watch_module._pid_alive(state.pid):
+        return CheckResult(
+            name="watcher",
+            status=STATUS_ERROR,
+            detail=f"stale state file (pid {state.pid} not running)",
+            fix=f"run `xcindex watch` again — the stale state will be cleaned up automatically",
+            group=GROUP_PROJECT,
+        )
+
+    parts = [f"running (pid={state.pid}"]
+    if state.started_at:
+        parts.append(f"since {state.started_at}")
+    if state.prewarm_count > 0:
+        last_mode = state.last_prewarm_mode or "?"
+        last_secs = state.last_prewarm_seconds or 0.0
+        parts.append(f"last prewarm: {last_mode} {last_secs:.1f}s")
+    detail = ", ".join(parts) + ")"
+
+    if state.prewarm_count >= 3 and state.prewarm_errors / state.prewarm_count > 0.5:
+        detail = f"{detail} — {state.prewarm_errors}/{state.prewarm_count} prewarms failed"
+        return CheckResult(
+            name="watcher",
+            status=STATUS_WARN,
+            detail=detail,
+            fix=f"check the most recent error: {state.last_error or '(none recorded)'}",
+            group=GROUP_PROJECT,
+        )
+
+    return CheckResult(
+        name="watcher",
+        status=STATUS_OK,
+        detail=detail,
+        group=GROUP_PROJECT,
+    )
+
+
 def check_git_repo(cwd: Path | None = None) -> CheckResult:
     """Detect whether the working directory is inside a git repo and
     whether the `git` CLI is reachable. Required only by `xcindex git`."""
@@ -490,6 +558,7 @@ def run_all_checks(
             index_store_override=index_store_override,
             derived_data_override=derived_data_override,
         ),
+        check_watcher_status(cwd),
         check_git_repo(cwd),
     ]
 

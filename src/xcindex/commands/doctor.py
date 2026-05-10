@@ -16,12 +16,12 @@ from xcindex.output import (
 def register(subparsers) -> None:
     parser = subparsers.add_parser(
         "doctor",
-        help="Validate environment, toolchain, IndexStore, cache, and git state.",
+        help="Validate environment, toolchain, IndexStore, cache, watcher, and git state.",
         description=(
             "Run a series of checks against the local environment "
             "(macOS / Python / Xcode toolchain / pipx / cache dir / helper / project / "
-            "IndexStore / cache freshness vs IndexStore / git working tree) and "
-            "report status."
+            "IndexStore / cache freshness vs IndexStore / `xcindex watch` status / "
+            "git working tree) and report status."
         ),
     )
     parser.add_argument("--json", dest="json_mode", action="store_true",

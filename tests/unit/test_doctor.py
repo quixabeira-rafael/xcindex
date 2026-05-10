@@ -300,3 +300,93 @@ def test_run_all_checks_includes_cache_warm(tmp_path: Path):
     results = doctor.run_all_checks(tmp_path)
     names = {r.name for r in results}
     assert "cache-warm" in names
+
+
+# --- check_watcher_status ---------------------------------------------------
+
+def test_check_watcher_status_no_project(tmp_path: Path):
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    result = doctor.check_watcher_status(bare)
+    assert result.status == doctor.STATUS_INFO
+    assert "no project" in result.detail
+
+
+def test_check_watcher_status_no_state(tmp_path: Path, monkeypatch):
+    import xcindex.cache as cache_module_local
+    monkeypatch.setattr(cache_module_local, "CACHE_ROOT", tmp_path / "xcache")
+    (tmp_path / "Package.swift").write_text("// stub\n")
+    result = doctor.check_watcher_status(tmp_path)
+    assert result.status == doctor.STATUS_INFO
+    assert "no watcher running" in result.detail
+
+
+def test_check_watcher_status_alive_returns_ok(tmp_path: Path, monkeypatch):
+    import os
+    import xcindex.cache as cache_module_local
+    from xcindex import watch as watch_module
+    monkeypatch.setattr(cache_module_local, "CACHE_ROOT", tmp_path / "xcache")
+    (tmp_path / "Package.swift").write_text("// stub\n")
+    state = watch_module.WatchState(
+        pid=os.getpid(),
+        project_path=str(tmp_path / "Package.swift"),
+        index_store_path="/tmp/idx",
+        started_at="2026-05-10T14:00:00Z",
+        debounce_ms=500,
+        prewarm_count=2,
+        prewarm_errors=0,
+        last_prewarm_mode="incremental",
+        last_prewarm_seconds=0.7,
+    )
+    watch_module.write_state(tmp_path / "Package.swift", state)
+    result = doctor.check_watcher_status(tmp_path)
+    assert result.status == doctor.STATUS_OK
+    assert "running" in result.detail
+    assert f"pid={os.getpid()}" in result.detail
+
+
+def test_check_watcher_status_high_error_rate_returns_warn(tmp_path: Path, monkeypatch):
+    import os
+    import xcindex.cache as cache_module_local
+    from xcindex import watch as watch_module
+    monkeypatch.setattr(cache_module_local, "CACHE_ROOT", tmp_path / "xcache")
+    (tmp_path / "Package.swift").write_text("// stub\n")
+    state = watch_module.WatchState(
+        pid=os.getpid(),
+        project_path=str(tmp_path / "Package.swift"),
+        index_store_path="/tmp/idx",
+        started_at="2026-05-10T14:00:00Z",
+        debounce_ms=500,
+        prewarm_count=4,
+        prewarm_errors=3,
+        last_error="simulated failure",
+    )
+    watch_module.write_state(tmp_path / "Package.swift", state)
+    result = doctor.check_watcher_status(tmp_path)
+    assert result.status == doctor.STATUS_WARN
+    assert "3/4 prewarms failed" in result.detail
+
+
+def test_check_watcher_status_stale_pid_returns_error(tmp_path: Path, monkeypatch):
+    import xcindex.cache as cache_module_local
+    from xcindex import watch as watch_module
+    monkeypatch.setattr(cache_module_local, "CACHE_ROOT", tmp_path / "xcache")
+    (tmp_path / "Package.swift").write_text("// stub\n")
+    state = watch_module.WatchState(
+        pid=99999999,  # definitely not alive
+        project_path=str(tmp_path / "Package.swift"),
+        index_store_path="/tmp/idx",
+        started_at="2026-05-10T14:00:00Z",
+        debounce_ms=500,
+    )
+    watch_module.write_state(tmp_path / "Package.swift", state)
+    result = doctor.check_watcher_status(tmp_path)
+    assert result.status == doctor.STATUS_ERROR
+    assert "stale" in result.detail.lower()
+
+
+def test_run_all_checks_includes_watcher(tmp_path: Path):
+    (tmp_path / ".git").mkdir()
+    results = doctor.run_all_checks(tmp_path)
+    names = {r.name for r in results}
+    assert "watcher" in names
