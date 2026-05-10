@@ -390,3 +390,56 @@ def test_run_all_checks_includes_watcher(tmp_path: Path):
     results = doctor.run_all_checks(tmp_path)
     names = {r.name for r in results}
     assert "watcher" in names
+
+
+# --- check_cache_gc ---------------------------------------------------------
+
+def test_check_cache_gc_no_caches(tmp_path: Path, monkeypatch):
+    import xcindex.cache as cache_module_local
+    monkeypatch.setattr(cache_module_local, "CACHE_ROOT", tmp_path / "xcache")
+    result = doctor.check_cache_gc()
+    assert result.status == doctor.STATUS_OK
+    assert "no caches stored" in result.detail
+
+
+def test_check_cache_gc_no_idle_caches(tmp_path: Path, monkeypatch):
+    import os
+    import time
+    import xcindex.cache as cache_module_local
+    cache_root = tmp_path / "xcache"
+    cache_root.mkdir()
+    monkeypatch.setattr(cache_module_local, "CACHE_ROOT", cache_root)
+    # Fresh cache (mtime = now)
+    cdir = cache_root / "fresh"
+    cdir.mkdir()
+    sqlite = cdir / cache_module_local.LIVE_SQLITE_NAME
+    sqlite.write_bytes(b"stub")
+    result = doctor.check_cache_gc(max_idle_seconds=3600)
+    assert result.status == doctor.STATUS_OK
+    assert "1 cache(s) active" in result.detail
+
+
+def test_check_cache_gc_reports_idle(tmp_path: Path, monkeypatch):
+    import os
+    import time
+    import xcindex.cache as cache_module_local
+    cache_root = tmp_path / "xcache"
+    cache_root.mkdir()
+    monkeypatch.setattr(cache_module_local, "CACHE_ROOT", cache_root)
+    cdir = cache_root / "old"
+    cdir.mkdir()
+    sqlite = cdir / cache_module_local.LIVE_SQLITE_NAME
+    sqlite.write_bytes(b"stub")
+    target_mtime = time.time() - 7200  # 2h ago
+    os.utime(sqlite, (target_mtime, target_mtime))
+    result = doctor.check_cache_gc(max_idle_seconds=3600)
+    assert result.status == doctor.STATUS_INFO
+    assert "1 cache(s) idle" in result.detail
+    assert result.fix is not None and "cache gc" in result.fix
+
+
+def test_run_all_checks_includes_cache_gc(tmp_path: Path):
+    (tmp_path / ".git").mkdir()
+    results = doctor.run_all_checks(tmp_path)
+    names = {r.name for r in results}
+    assert "cache-gc" in names

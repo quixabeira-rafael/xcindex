@@ -406,6 +406,51 @@ def check_cache_warm(
     )
 
 
+def check_cache_gc(*, max_idle_seconds: int = 3600) -> CheckResult:
+    """Reports how many caches are idle past the GC threshold.
+
+    Always informational — never warns or errors. The user (or hooks)
+    decides when to actually run `xcindex cache gc`.
+    """
+    result = cache_module.gc_idle_caches(
+        max_idle_seconds=max_idle_seconds, dry_run=True,
+    )
+    if not result.pruned:
+        if not result.kept:
+            return CheckResult(
+                name="cache-gc",
+                status=STATUS_OK,
+                detail="no caches stored",
+                group=GROUP_CACHE,
+            )
+        return CheckResult(
+            name="cache-gc",
+            status=STATUS_OK,
+            detail=f"{len(result.kept)} cache(s) active, none idle > {max_idle_seconds // 60} min",
+            group=GROUP_CACHE,
+        )
+
+    threshold_minutes = max_idle_seconds // 60
+    bytes_label = _format_bytes(result.bytes_freed)
+    return CheckResult(
+        name="cache-gc",
+        status=STATUS_INFO,
+        detail=f"{len(result.pruned)} cache(s) idle > {threshold_minutes} min ({bytes_label} reclaimable)",
+        fix=f"run `xcindex cache gc` to free disk space",
+        group=GROUP_CACHE,
+    )
+
+
+def _format_bytes(num_bytes: int) -> str:
+    units = ("B", "KB", "MB", "GB")
+    value: float = float(num_bytes)
+    for unit in units:
+        if value < 1024:
+            return f"{value:.0f} {unit}"
+        value /= 1024
+    return f"{value:.0f} TB"
+
+
 def check_watcher_status(cwd: Path | None = None) -> CheckResult:
     """Reports whether `xcindex watch` is running for the current project.
 
@@ -558,6 +603,7 @@ def run_all_checks(
             index_store_override=index_store_override,
             derived_data_override=derived_data_override,
         ),
+        check_cache_gc(),
         check_watcher_status(cwd),
         check_git_repo(cwd),
     ]
