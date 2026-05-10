@@ -16,6 +16,7 @@ from xcindex.commands import neighbors as neighbors_commands
 from xcindex.commands import occurrences as occurrences_commands
 from xcindex.commands import prewarm as prewarm_commands
 from xcindex.commands import reach as reach_commands
+from xcindex.commands import watch as watch_commands
 from xcindex.commands import relations as relations_commands
 from xcindex.commands import search as search_commands
 from xcindex.commands import setup as setup_commands
@@ -37,6 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_commands.register(subparsers)
     cache_commands.register(subparsers)
     prewarm_commands.register(subparsers)
+    watch_commands.register(subparsers)
     at_commands.register(subparsers)
     containing_commands.register(subparsers)
     file_commands.register(subparsers)
