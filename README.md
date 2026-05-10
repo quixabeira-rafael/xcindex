@@ -50,7 +50,8 @@ when Xcode rebuilds (different hash → fresh dump).
 | `prewarm`       | Materialize the SQLite cache from the IndexStore (cold/incremental/noop). Wire into a build hook to keep query latency warm. |
 | `watch`         | Foreground process that listens for IndexStore changes and runs `prewarm` automatically (single-instance per project, ~30MB resident, debounced). |
 | `cache list`    | List cached SQLite files                               |
-| `cache clear`   | Remove cached SQLite files                             |
+| `cache clear`   | Remove cached SQLite files (explicit, by project or `--all`) |
+| `cache gc`      | Garbage-collect caches idle for >N minutes (default 60); good for cleaning up stale subagent worktrees |
 | `search NAME`   | Substring search by symbol name (case-insensitive)     |
 | `symbol USR\|NAME` | Look up a symbol's metadata                         |
 | `at FILE:L[:C]` | List symbols/occurrences at a position                 |
@@ -264,6 +265,43 @@ take it down. State is cleaned on graceful exit (SIGINT/SIGTERM).
 
 Project-aware hooks (Tuist plugin auto-install, Build Phase script generation,
 scheme post-action injection) are planned as `xcindex profile` in a follow-up.
+
+### Hook 3 — Claude Code session hooks (`xcindex setup hooks`)
+
+When you develop through [Claude Code](https://claude.com/code), `xcindex` can
+auto-install three session hooks into `~/.claude/settings.json`:
+
+```bash
+xcindex setup hooks install      # adds the 3 hooks (idempotent)
+xcindex setup hooks status       # shows what's installed
+xcindex setup hooks uninstall    # removes only xcindex-managed entries
+```
+
+The hooks installed:
+
+| Event | Action |
+|---|---|
+| `SessionStart` | spawns `xcindex watch` in background |
+| `SessionEnd`   | kills the watcher and runs `xcindex cache gc` |
+| `SubagentStop` | runs `xcindex cache gc` (catches subagent-worktree leaks) |
+
+Each managed entry carries a sentinel comment so the installer is idempotent
+and the uninstaller never touches your other (non-xcindex) hooks.
+
+### Subagents and git worktrees
+
+When Claude Code spawns subagents with `isolation: "worktree"`, the harness
+creates a temporary `git worktree` at a fresh path. xcindex correctly indexes
+each worktree separately (different absolute path → different cache
+fingerprint → different SQLite file), so subagents don't fight over the same
+cache.
+
+The watcher started by `SessionStart` only observes the **outer** session's
+IndexStore — it doesn't track subagent worktrees. Subagents pay their own
+on-demand cold dump on first xcindex query inside the worktree. After the
+subagent ends, the worktree is removed; its cache lingers until the next
+`xcindex cache gc` (auto-triggered by `SubagentStop` and `SessionEnd` hooks
+above) — caches idle for >60 minutes are pruned automatically.
 
 ## Limitations
 

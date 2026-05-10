@@ -215,13 +215,23 @@ xcindex watch --debounce 1000  # wait 1s after last event before prewarming
 ```
 Subscribes to FSEvents on the IndexStore, debounces bursts, spawns `prewarm` per settled event. Single-instance per project. Resilient — keeps running even when individual prewarms fail.
 
+**Hook option 3 — Claude Code session hooks** (recommended for dev-via-Claude):
+```bash
+xcindex setup hooks install      # writes to ~/.claude/settings.json
+xcindex setup hooks status
+xcindex setup hooks uninstall
+```
+Installs three hooks: `SessionStart` spawns the watcher, `SessionEnd` kills it and runs `cache gc`, `SubagentStop` runs `cache gc`. Idempotent; preserves other (non-xcindex) hooks. After install, every Claude session auto-keeps the cache warm and cleans up worktree-derived caches when subagents finish.
+
 Watcher status is reported by `xcindex doctor`:
 - `[OK] watcher running (pid=…, since…, last prewarm: incremental 0.7s)` — healthy
 - `[!!] watcher running (...) — 3/4 prewarms failed` — escalates to WARN
 - `[--] no watcher running` — info, with `xcindex watch` as fix hint
 - `[XX] stale state file (pid X not running)` — error, auto-cleaned on next start
 
-When the user asks for "auto" cache warming and is fine with a foreground process, recommend Hook 2. When they only build from CLI and don't want a long-running process, recommend Hook 1. Project-aware auto-installation (Tuist plugin, etc.) is deferred to the planned `xcindex profile` feature.
+When the user asks for "auto" cache warming and is fine with a foreground process, recommend Hook 2. When they're using Claude Code as their primary dev tool, recommend Hook 3 — it's purpose-built for this scenario. Project-aware auto-installation for non-Claude flows (Tuist plugin, Build Phase, etc.) is deferred to the planned `xcindex profile` feature.
+
+**Subagents + worktrees:** When you spawn a subagent with `isolation: "worktree"`, xcindex automatically gets a separate cache for the worktree (distinct project path → distinct fingerprint). The outer-session watcher does NOT cover worktree builds — the subagent pays its own cold dump on first query in the worktree. After the worktree is removed, the cache lingers; `cache gc` (auto-triggered by `SubagentStop` and `SessionEnd` if Hook 3 is installed) prunes any cache idle for >60min. If the user asks "is xcindex worktree-aware?" the answer is YES — each worktree is its own cache, and stale caches auto-clean.
 
 ## Everything else: read `--help`
 
