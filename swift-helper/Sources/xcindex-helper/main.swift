@@ -9,8 +9,8 @@
 
 import Foundation
 
-let HELPER_VERSION = "0.3.0"
-let SCHEMA_VERSION = 3
+let HELPER_VERSION = "0.4.0"
+let SCHEMA_VERSION = 4
 
 // MARK: - Entry point
 

@@ -88,6 +88,11 @@ private func performIncremental(
 
     try writer.applyPragmas(Schema.writePragmas)
     try writer.prepareInsertStatements()
+    // v4: pre-load the existing USR cache so re-inserted symbols keep
+    // their original `usr_id`. Without this, the cache would start empty
+    // and the writer would assign fresh ids to USRs already in the table,
+    // breaking referential integrity.
+    try writer.loadExistingUSRs()
 
     let affectedUnits = Array(Set(modifiedUnits).union(removedUnits))
     let filesToRedump = try writer.filesForUnits(affectedUnits)

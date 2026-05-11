@@ -7,14 +7,24 @@
 import Foundation
 
 enum Schema {
-    static let version: Int = 3
+    static let version: Int = 4
 
     /// CREATE TABLE statements run on a fresh DB during bootstrap.
     /// Indexes are created separately at the end of bootstrap (idx).
+    ///
+    /// v4 introduces USR interning: every USR appears once in `usrs.text`
+    /// and is referenced everywhere else by `usr_id INTEGER`. Cuts the cache
+    /// roughly in half on large workspaces.
     static let createStatements: [String] = [
         """
+        CREATE TABLE usrs (
+          id   INTEGER PRIMARY KEY AUTOINCREMENT,
+          text TEXT NOT NULL UNIQUE
+        )
+        """,
+        """
         CREATE TABLE symbols (
-          usr        TEXT PRIMARY KEY,
+          usr_id     INTEGER PRIMARY KEY,
           name       TEXT NOT NULL,
           kind       TEXT NOT NULL,
           sub_kind   TEXT,
@@ -28,23 +38,23 @@ enum Schema {
         """,
         """
         CREATE TABLE occurrences (
-          id            INTEGER PRIMARY KEY,
-          symbol_usr    TEXT NOT NULL,
-          file          TEXT NOT NULL,
-          line          INTEGER NOT NULL,
-          column        INTEGER NOT NULL,
-          roles         INTEGER NOT NULL,
-          container_usr TEXT,
-          unit_name     TEXT
+          id               INTEGER PRIMARY KEY,
+          symbol_usr_id    INTEGER NOT NULL,
+          file             TEXT NOT NULL,
+          line             INTEGER NOT NULL,
+          column           INTEGER NOT NULL,
+          roles            INTEGER NOT NULL,
+          container_usr_id INTEGER,
+          unit_name        TEXT
         )
         """,
         """
         CREATE TABLE relations (
-          occurrence_id INTEGER NOT NULL,
-          related_usr   TEXT NOT NULL,
-          related_name  TEXT,
-          kind          TEXT NOT NULL,
-          roles         INTEGER NOT NULL
+          occurrence_id  INTEGER NOT NULL,
+          related_usr_id INTEGER NOT NULL,
+          related_name   TEXT,
+          kind           TEXT NOT NULL,
+          roles          INTEGER NOT NULL
         )
         """,
         """
@@ -86,12 +96,13 @@ enum Schema {
         "CREATE INDEX idx_sym_module       ON symbols(module)",
         "CREATE INDEX idx_sym_kind         ON symbols(kind)",
         "CREATE INDEX idx_sym_name_nocase  ON symbols(name COLLATE NOCASE)",
+        "CREATE INDEX idx_sym_name         ON symbols(name)",
         "CREATE INDEX idx_sym_file         ON symbols(file)",
-        "CREATE INDEX idx_occ_symbol       ON occurrences(symbol_usr)",
+        "CREATE INDEX idx_occ_symbol       ON occurrences(symbol_usr_id)",
         "CREATE INDEX idx_occ_file_line    ON occurrences(file, line, column)",
-        "CREATE INDEX idx_occ_container    ON occurrences(container_usr)",
+        "CREATE INDEX idx_occ_container    ON occurrences(container_usr_id)",
         "CREATE INDEX idx_occ_unit         ON occurrences(unit_name)",
-        "CREATE INDEX idx_rel_related_kind ON relations(related_usr, kind)",
+        "CREATE INDEX idx_rel_related_kind ON relations(related_usr_id, kind)",
         "CREATE INDEX idx_rel_occ          ON relations(occurrence_id)",
         "CREATE INDEX idx_unit_files_file  ON unit_files(file)",
         "CREATE INDEX idx_unit_files_unit  ON unit_files(unit_name)",

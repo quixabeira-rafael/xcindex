@@ -3,12 +3,18 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 CREATE_STATEMENTS = (
     """
+    CREATE TABLE IF NOT EXISTS usrs (
+      id   INTEGER PRIMARY KEY AUTOINCREMENT,
+      text TEXT NOT NULL UNIQUE
+    );
+    """,
+    """
     CREATE TABLE IF NOT EXISTS symbols (
-      usr        TEXT PRIMARY KEY,
+      usr_id     INTEGER PRIMARY KEY,
       name       TEXT NOT NULL,
       kind       TEXT NOT NULL,
       sub_kind   TEXT,
@@ -22,23 +28,23 @@ CREATE_STATEMENTS = (
     """,
     """
     CREATE TABLE IF NOT EXISTS occurrences (
-      id            INTEGER PRIMARY KEY,
-      symbol_usr    TEXT NOT NULL,
-      file          TEXT NOT NULL,
-      line          INTEGER NOT NULL,
-      column        INTEGER NOT NULL,
-      roles         INTEGER NOT NULL,
-      container_usr TEXT,
-      unit_name     TEXT
+      id               INTEGER PRIMARY KEY,
+      symbol_usr_id    INTEGER NOT NULL,
+      file             TEXT NOT NULL,
+      line             INTEGER NOT NULL,
+      column           INTEGER NOT NULL,
+      roles            INTEGER NOT NULL,
+      container_usr_id INTEGER,
+      unit_name        TEXT
     );
     """,
     """
     CREATE TABLE IF NOT EXISTS relations (
-      occurrence_id INTEGER NOT NULL,
-      related_usr   TEXT NOT NULL,
-      related_name  TEXT,
-      kind          TEXT NOT NULL,
-      roles         INTEGER NOT NULL
+      occurrence_id  INTEGER NOT NULL,
+      related_usr_id INTEGER NOT NULL,
+      related_name   TEXT,
+      kind           TEXT NOT NULL,
+      roles          INTEGER NOT NULL
     );
     """,
     """
@@ -77,15 +83,16 @@ INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS idx_sym_module       ON symbols(module);",
     "CREATE INDEX IF NOT EXISTS idx_sym_kind         ON symbols(kind);",
     "CREATE INDEX IF NOT EXISTS idx_sym_name_nocase  ON symbols(name COLLATE NOCASE);",
-    "CREATE INDEX IF NOT EXISTS idx_occ_symbol       ON occurrences(symbol_usr);",
+    "CREATE INDEX IF NOT EXISTS idx_sym_name         ON symbols(name);",
+    "CREATE INDEX IF NOT EXISTS idx_sym_file         ON symbols(file);",
+    "CREATE INDEX IF NOT EXISTS idx_occ_symbol       ON occurrences(symbol_usr_id);",
     "CREATE INDEX IF NOT EXISTS idx_occ_file_line    ON occurrences(file, line, column);",
-    "CREATE INDEX IF NOT EXISTS idx_occ_container    ON occurrences(container_usr);",
+    "CREATE INDEX IF NOT EXISTS idx_occ_container    ON occurrences(container_usr_id);",
     "CREATE INDEX IF NOT EXISTS idx_occ_unit         ON occurrences(unit_name);",
-    "CREATE INDEX IF NOT EXISTS idx_rel_related_kind ON relations(related_usr, kind);",
+    "CREATE INDEX IF NOT EXISTS idx_rel_related_kind ON relations(related_usr_id, kind);",
     "CREATE INDEX IF NOT EXISTS idx_rel_occ          ON relations(occurrence_id);",
     "CREATE INDEX IF NOT EXISTS idx_unit_files_file  ON unit_files(file);",
     "CREATE INDEX IF NOT EXISTS idx_unit_files_unit  ON unit_files(unit_name);",
-    "CREATE INDEX IF NOT EXISTS idx_sym_file         ON symbols(file);",
 )
 
 

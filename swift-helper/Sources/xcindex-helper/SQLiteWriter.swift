@@ -40,6 +40,12 @@ final class SQLiteWriter {
     private var unitFilesStmt: OpaquePointer?
     private var unitsStmt: OpaquePointer?
     private var metaStmt: OpaquePointer?
+    private var usrInsertStmt: OpaquePointer?
+
+    /// In-memory USR -> id cache. Populated lazily during inserts, or
+    /// loaded up-front via `loadExistingUSRs()` for incremental sessions
+    /// so we keep stable ids across runs.
+    private var usrCache: [String: Int64] = [:]
 
     init(path: String) throws {
         var handle: OpaquePointer?
@@ -59,6 +65,7 @@ final class SQLiteWriter {
         sqlite3_finalize(unitFilesStmt)
         sqlite3_finalize(unitsStmt)
         sqlite3_finalize(metaStmt)
+        sqlite3_finalize(usrInsertStmt)
         sqlite3_close(db)
     }
 
@@ -69,6 +76,7 @@ final class SQLiteWriter {
         sqlite3_finalize(unitFilesStmt); unitFilesStmt = nil
         sqlite3_finalize(unitsStmt); unitsStmt = nil
         sqlite3_finalize(metaStmt); metaStmt = nil
+        sqlite3_finalize(usrInsertStmt); usrInsertStmt = nil
         sqlite3_close(db)
         db = nil
     }
@@ -100,18 +108,19 @@ final class SQLiteWriter {
     // MARK: - Prepared inserts (called once before the hot loop)
 
     func prepareInsertStatements() throws {
+        usrInsertStmt = try prepare("INSERT INTO usrs(text) VALUES (?)")
         symbolStmt = try prepare("""
             INSERT OR REPLACE INTO symbols(
-                usr, name, kind, sub_kind, language, module, file, line, is_system, properties
+                usr_id, name, kind, sub_kind, language, module, file, line, is_system, properties
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """)
         occurrenceStmt = try prepare("""
             INSERT INTO occurrences(
-                symbol_usr, file, line, column, roles, container_usr, unit_name
+                symbol_usr_id, file, line, column, roles, container_usr_id, unit_name
             ) VALUES (?, ?, ?, ?, ?, ?, ?)
         """)
         relationStmt = try prepare("""
-            INSERT INTO relations(occurrence_id, related_usr, related_name, kind, roles)
+            INSERT INTO relations(occurrence_id, related_usr_id, related_name, kind, roles)
             VALUES (?, ?, ?, ?, ?)
         """)
         unitFilesStmt = try prepare("""
@@ -125,6 +134,41 @@ final class SQLiteWriter {
         metaStmt = try prepare("""
             INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)
         """)
+    }
+
+    /// Pre-populate the USR cache from an existing `usrs` table. Required for
+    /// incremental sessions so reused USRs keep their original ids — orphan
+    /// rows that get re-inserted reference the same usr_id as before.
+    func loadExistingUSRs() throws {
+        var stmt: OpaquePointer?
+        let rc = sqlite3_prepare_v2(db, "SELECT id, text FROM usrs", -1, &stmt, nil)
+        if rc != SQLITE_OK {
+            throw SQLiteWriterError.prepareFailed(
+                sql: "SELECT id, text FROM usrs",
+                message: String(cString: sqlite3_errmsg(db))
+            )
+        }
+        defer { sqlite3_finalize(stmt) }
+        usrCache.removeAll(keepingCapacity: true)
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let id = sqlite3_column_int64(stmt, 0)
+            if let cstr = sqlite3_column_text(stmt, 1) {
+                usrCache[String(cString: cstr)] = id
+            }
+        }
+    }
+
+    /// Resolve a USR string to its integer id, inserting into `usrs` if needed.
+    @inline(__always)
+    private func internUSR(_ usr: String) -> Int64 {
+        if let id = usrCache[usr] { return id }
+        guard let stmt = usrInsertStmt else { return 0 }
+        bindText(stmt, 1, usr)
+        sqlite3_step(stmt)
+        sqlite3_reset(stmt)
+        let id = sqlite3_last_insert_rowid(db)
+        usrCache[usr] = id
+        return id
     }
 
     private func prepare(_ sql: String) throws -> OpaquePointer {
@@ -152,7 +196,7 @@ final class SQLiteWriter {
         properties: UInt64
     ) {
         guard let stmt = symbolStmt else { return }
-        bindText(stmt, 1, usr)
+        sqlite3_bind_int64(stmt, 1, internUSR(usr))
         bindText(stmt, 2, name)
         bindText(stmt, 3, kind)
         bindOptionalText(stmt, 4, subKind)
@@ -181,12 +225,16 @@ final class SQLiteWriter {
         unitName: String?
     ) -> sqlite3_int64 {
         guard let stmt = occurrenceStmt else { return 0 }
-        bindText(stmt, 1, symbolUSR)
+        sqlite3_bind_int64(stmt, 1, internUSR(symbolUSR))
         bindText(stmt, 2, file)
         sqlite3_bind_int64(stmt, 3, sqlite3_int64(line))
         sqlite3_bind_int64(stmt, 4, sqlite3_int64(column))
         bindUInt64Signed(stmt, 5, roles)
-        bindOptionalText(stmt, 6, containerUSR)
+        if let c = containerUSR {
+            sqlite3_bind_int64(stmt, 6, internUSR(c))
+        } else {
+            sqlite3_bind_null(stmt, 6)
+        }
         bindOptionalText(stmt, 7, unitName)
         sqlite3_step(stmt)
         let rowid = sqlite3_last_insert_rowid(db)
@@ -203,7 +251,7 @@ final class SQLiteWriter {
     ) {
         guard let stmt = relationStmt else { return }
         sqlite3_bind_int64(stmt, 1, occurrenceID)
-        bindText(stmt, 2, relatedUSR)
+        sqlite3_bind_int64(stmt, 2, internUSR(relatedUSR))
         bindOptionalText(stmt, 3, relatedName)
         bindText(stmt, 4, kind)
         bindUInt64Signed(stmt, 5, roles)
