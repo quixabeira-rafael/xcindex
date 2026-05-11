@@ -22,6 +22,15 @@ def _build_call_graph(edges: list[tuple[str, str, str, str | None, int | None]])
     schema.apply_schema(conn)
     cur = conn.cursor()
 
+    usr_id_map: dict[str, int] = {}
+
+    def intern(usr: str) -> int:
+        if usr in usr_id_map:
+            return usr_id_map[usr]
+        cur.execute("INSERT INTO usrs(text) VALUES (?)", (usr,))
+        usr_id_map[usr] = cur.lastrowid
+        return usr_id_map[usr]
+
     seen_symbols: set[str] = set()
     occ_id = 0
     for caller, callee, _kind, file, line in edges:
@@ -30,20 +39,20 @@ def _build_call_graph(edges: list[tuple[str, str, str, str | None, int | None]])
                 continue
             seen_symbols.add(usr)
             cur.execute(
-                "INSERT INTO symbols(usr, name, kind, sub_kind, language, module, file, line, is_system, properties) "
+                "INSERT INTO symbols(usr_id, name, kind, sub_kind, language, module, file, line, is_system, properties) "
                 "VALUES (?, ?, 'instance-method', NULL, 'swift', 'Mod', ?, ?, 0, 0)",
-                (usr, usr.upper(), file or f"{usr}.swift", line or 1),
+                (intern(usr), usr.upper(), file or f"{usr}.swift", line or 1),
             )
     for caller, callee, kind, file, line in edges:
         occ_id += 1
         cur.execute(
-            "INSERT INTO occurrences(id, symbol_usr, file, line, column, roles, container_usr, unit_name) "
+            "INSERT INTO occurrences(id, symbol_usr_id, file, line, column, roles, container_usr_id, unit_name) "
             "VALUES (?, ?, ?, ?, 1, 32, ?, 'u1')",
-            (occ_id, callee, file or f"{caller}.swift", line or 1, caller),
+            (occ_id, intern(callee), file or f"{caller}.swift", line or 1, intern(caller)),
         )
         cur.execute(
-            "INSERT INTO relations(occurrence_id, related_usr, related_name, kind, roles) VALUES (?, ?, ?, ?, 0)",
-            (occ_id, caller, caller.upper(), kind),
+            "INSERT INTO relations(occurrence_id, related_usr_id, related_name, kind, roles) VALUES (?, ?, ?, ?, 0)",
+            (occ_id, intern(caller), caller.upper(), kind),
         )
     schema.apply_indexes(conn)
     conn.commit()
@@ -227,27 +236,30 @@ def test_upstream_to_module_filters_root():
     conn.row_factory = sqlite3.Row
     schema.apply_schema(conn)
     cur = conn.cursor()
+    USR_IDS = {"T": 1, "A": 2, "B": 3}
+    cur.executemany("INSERT INTO usrs(id, text) VALUES (?, ?)",
+                    [(uid, text) for text, uid in USR_IDS.items()])
     cur.executemany(
-        "INSERT INTO symbols(usr, name, kind, sub_kind, language, module, file, line, is_system, properties) "
+        "INSERT INTO symbols(usr_id, name, kind, sub_kind, language, module, file, line, is_system, properties) "
         "VALUES (?, ?, 'instance-method', NULL, 'swift', ?, ?, 1, 0, 0)",
         [
-            ("T", "T", "Core", "Core/T.swift"),
-            ("A", "A", "UI",   "UI/A.swift"),
-            ("B", "B", "Domain", "Domain/B.swift"),
+            (USR_IDS["T"], "T", "Core",   "Core/T.swift"),
+            (USR_IDS["A"], "A", "UI",     "UI/A.swift"),
+            (USR_IDS["B"], "B", "Domain", "Domain/B.swift"),
         ],
     )
     cur.executemany(
-        "INSERT INTO occurrences(id, symbol_usr, file, line, column, roles, container_usr, unit_name) "
+        "INSERT INTO occurrences(id, symbol_usr_id, file, line, column, roles, container_usr_id, unit_name) "
         "VALUES (?, ?, ?, ?, 1, 32, ?, 'u1')",
         [
-            (1, "T", "UI/A.swift", 5, "A"),
-            (2, "T", "Domain/B.swift", 5, "B"),
+            (1, USR_IDS["T"], "UI/A.swift",     5, USR_IDS["A"]),
+            (2, USR_IDS["T"], "Domain/B.swift", 5, USR_IDS["B"]),
         ],
     )
     cur.executemany(
-        "INSERT INTO relations(occurrence_id, related_usr, related_name, kind, roles) "
+        "INSERT INTO relations(occurrence_id, related_usr_id, related_name, kind, roles) "
         "VALUES (?, ?, ?, 'calledBy', 0)",
-        [(1, "A", "A"), (2, "B", "B")],
+        [(1, USR_IDS["A"], "A"), (2, USR_IDS["B"], "B")],
     )
     schema.apply_indexes(conn)
     conn.commit()
@@ -331,9 +343,12 @@ def test_no_callers_no_callees_empty_canonical():
     # Isolated symbol with no relations
     conn = _build_call_graph([])
     cur = conn.cursor()
+    cur.execute("INSERT INTO usrs(text) VALUES ('T')")
+    t_id = cur.lastrowid
     cur.execute(
-        "INSERT INTO symbols(usr, name, kind, sub_kind, language, module, file, line, is_system, properties) "
-        "VALUES ('T', 'T', 'instance-method', NULL, 'swift', 'Mod', 'T.swift', 1, 0, 0)"
+        "INSERT INTO symbols(usr_id, name, kind, sub_kind, language, module, file, line, is_system, properties) "
+        "VALUES (?, 'T', 'instance-method', NULL, 'swift', 'Mod', 'T.swift', 1, 0, 0)",
+        (t_id,),
     )
     conn.commit()
     canonical = impact_module.build_call_stacks(
@@ -353,27 +368,31 @@ def test_type_canonical_includes_structure_block():
     conn.row_factory = sqlite3.Row
     schema.apply_schema(conn)
     cur = conn.cursor()
+    USR_IDS = {"foo": 1, "bar": 2, "subfoo": 3}
+    cur.executemany("INSERT INTO usrs(id, text) VALUES (?, ?)",
+                    [(uid, text) for text, uid in USR_IDS.items()])
     cur.executemany(
-        "INSERT INTO symbols(usr, name, kind, sub_kind, language, module, file, line, is_system, properties) "
+        "INSERT INTO symbols(usr_id, name, kind, sub_kind, language, module, file, line, is_system, properties) "
         "VALUES (?, ?, ?, NULL, 'swift', 'Core', ?, ?, 0, 0)",
         [
-            ("foo", "Foo", "class", "Core/Foo.swift", 1),
-            ("bar", "bar()", "instance-method", "Core/Foo.swift", 3),
-            ("subfoo", "SubFoo", "class", "Domain/SubFoo.swift", 1),
+            (USR_IDS["foo"],    "Foo",    "class",           "Core/Foo.swift",      1),
+            (USR_IDS["bar"],    "bar()",  "instance-method", "Core/Foo.swift",      3),
+            (USR_IDS["subfoo"], "SubFoo", "class",           "Domain/SubFoo.swift", 1),
         ],
     )
     cur.executemany(
-        "INSERT INTO occurrences(id, symbol_usr, file, line, column, roles, container_usr, unit_name) VALUES (?, ?, ?, ?, 1, ?, ?, 'u1')",
+        "INSERT INTO occurrences(id, symbol_usr_id, file, line, column, roles, container_usr_id, unit_name) "
+        "VALUES (?, ?, ?, ?, 1, ?, ?, 'u1')",
         [
-            (1, "bar", "Core/Foo.swift", 3, 2, "foo"),
-            (2, "foo", "Domain/SubFoo.swift", 1, 4, None),
+            (1, USR_IDS["bar"], "Core/Foo.swift",      3, 2, USR_IDS["foo"]),
+            (2, USR_IDS["foo"], "Domain/SubFoo.swift", 1, 4, None),
         ],
     )
     cur.executemany(
-        "INSERT INTO relations(occurrence_id, related_usr, related_name, kind, roles) VALUES (?, ?, ?, ?, 0)",
+        "INSERT INTO relations(occurrence_id, related_usr_id, related_name, kind, roles) VALUES (?, ?, ?, ?, 0)",
         [
-            (1, "foo", "Foo", "childOf"),
-            (2, "subfoo", "SubFoo", "baseOf"),
+            (1, USR_IDS["foo"],    "Foo",    "childOf"),
+            (2, USR_IDS["subfoo"], "SubFoo", "baseOf"),
         ],
     )
     schema.apply_indexes(conn)
@@ -418,9 +437,12 @@ def test_build_impact_dispatches_to_call_stack_for_method():
 def test_build_impact_dispatches_to_usage_chain_for_class():
     conn = _build_call_graph([])
     cur = conn.cursor()
+    cur.execute("INSERT INTO usrs(text) VALUES ('T')")
+    t_id = cur.lastrowid
     cur.execute(
-        "INSERT INTO symbols(usr, name, kind, sub_kind, language, module, file, line, is_system, properties) "
-        "VALUES ('T', 'T', 'class', NULL, 'swift', 'Mod', 'T.swift', 1, 0, 0)"
+        "INSERT INTO symbols(usr_id, name, kind, sub_kind, language, module, file, line, is_system, properties) "
+        "VALUES (?, 'T', 'class', NULL, 'swift', 'Mod', 'T.swift', 1, 0, 0)",
+        (t_id,),
     )
     conn.commit()
     canonical = impact_module.build_impact(

@@ -29,16 +29,26 @@ def populated_conn():
     conn.row_factory = sqlite3.Row
     schema.apply_schema(conn)
     cur = conn.cursor()
+
+    # v4 schema: USRs interned. Pre-populate with known ids 1..6.
+    USR_IDS = {
+        "foo": 1, "bar": 2, "qux": 3,
+        "subfoo": 4, "caller": 5, "run": 6,
+    }
     cur.executemany(
-        "INSERT INTO symbols(usr, name, kind, sub_kind, language, module, file, line, is_system, properties) "
+        "INSERT INTO usrs(id, text) VALUES (?, ?)",
+        [(uid, text) for text, uid in USR_IDS.items()],
+    )
+    cur.executemany(
+        "INSERT INTO symbols(usr_id, name, kind, sub_kind, language, module, file, line, is_system, properties) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
-            ("foo",    "Foo",    "class",           None, "swift", "Core",   "Core/Foo.swift",       1, 0, 0),
-            ("bar",    "bar()",  "instance-method", None, "swift", "Core",   "Core/Foo.swift",       3, 0, 0),
-            ("qux",    "qux()",  "instance-method", None, "swift", "Core",   "Core/Foo.swift",       7, 0, 0),
-            ("subfoo", "SubFoo", "class",           None, "swift", "Domain", "Domain/SubFoo.swift",  2, 0, 0),
-            ("caller", "Caller", "class",           None, "swift", "UI",     "UI/Caller.swift",      1, 0, 0),
-            ("run",    "run()",  "instance-method", None, "swift", "UI",     "UI/Caller.swift",      5, 0, 0),
+            (USR_IDS["foo"],    "Foo",    "class",           None, "swift", "Core",   "Core/Foo.swift",       1, 0, 0),
+            (USR_IDS["bar"],    "bar()",  "instance-method", None, "swift", "Core",   "Core/Foo.swift",       3, 0, 0),
+            (USR_IDS["qux"],    "qux()",  "instance-method", None, "swift", "Core",   "Core/Foo.swift",       7, 0, 0),
+            (USR_IDS["subfoo"], "SubFoo", "class",           None, "swift", "Domain", "Domain/SubFoo.swift",  2, 0, 0),
+            (USR_IDS["caller"], "Caller", "class",           None, "swift", "UI",     "UI/Caller.swift",      1, 0, 0),
+            (USR_IDS["run"],    "run()",  "instance-method", None, "swift", "UI",     "UI/Caller.swift",      5, 0, 0),
         ],
     )
 
@@ -49,22 +59,24 @@ def populated_conn():
     # 4: bar() called inside run() at UI/Caller.swift:42 (relation: run calledBy bar)
     # 5: bar() childOf Foo (definition relation)
     cur.executemany(
-        "INSERT INTO occurrences(id, symbol_usr, file, line, column, roles, container_usr, unit_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO occurrences(id, symbol_usr_id, file, line, column, roles, container_usr_id, unit_name) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         [
-            (1, "foo",    "Core/Foo.swift",       1, 7,  2, None, "u1"),       # role=definition
-            (2, "bar",    "Core/Foo.swift",       3, 17, 2, "foo", "u1"),     # role=definition, container=foo
-            (3, "foo",    "Domain/SubFoo.swift",  2, 24, 4, None, "u2"),       # role=reference + baseOf
-            (4, "bar",    "UI/Caller.swift",      42, 18, 32, "run", "u3"),    # role=call (32=1<<5)
-            (5, "qux",    "Core/Foo.swift",       7, 17, 2, "foo", "u1"),
+            (1, USR_IDS["foo"], "Core/Foo.swift",      1, 7,  2,  None, "u1"),
+            (2, USR_IDS["bar"], "Core/Foo.swift",      3, 17, 2,  USR_IDS["foo"], "u1"),
+            (3, USR_IDS["foo"], "Domain/SubFoo.swift", 2, 24, 4,  None, "u2"),
+            (4, USR_IDS["bar"], "UI/Caller.swift",     42, 18, 32, USR_IDS["run"], "u3"),
+            (5, USR_IDS["qux"], "Core/Foo.swift",      7, 17, 2,  USR_IDS["foo"], "u1"),
         ],
     )
     cur.executemany(
-        "INSERT INTO relations(occurrence_id, related_usr, related_name, kind, roles) VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO relations(occurrence_id, related_usr_id, related_name, kind, roles) "
+        "VALUES (?, ?, ?, ?, ?)",
         [
-            (3, "subfoo", "SubFoo", "baseOf",     0),       # at occ 3 (Foo in SubFoo def): SubFoo has Foo as base
-            (4, "run",    "run()",  "calledBy",   0),       # at occ 4 (bar called in run): run is the caller
-            (2, "foo",    "Foo",    "childOf",    0),       # bar is child of Foo
-            (5, "foo",    "Foo",    "childOf",    0),       # qux is child of Foo
+            (3, USR_IDS["subfoo"], "SubFoo", "baseOf",     0),
+            (4, USR_IDS["run"],    "run()",  "calledBy",   0),
+            (2, USR_IDS["foo"],    "Foo",    "childOf",    0),
+            (5, USR_IDS["foo"],    "Foo",    "childOf",    0),
         ],
     )
     schema.apply_indexes(conn)
@@ -236,10 +248,12 @@ def test_find_files_returns_empty_when_missing(populated_conn):
 
 def test_find_files_returns_all_basename_collisions(populated_conn):
     cur = populated_conn.cursor()
+    cur.execute("INSERT INTO usrs(text) VALUES ('dupfoo')")
+    dupfoo_id = cur.lastrowid
     cur.execute(
-        "INSERT INTO symbols(usr, name, kind, sub_kind, language, module, file, line, is_system, properties) "
+        "INSERT INTO symbols(usr_id, name, kind, sub_kind, language, module, file, line, is_system, properties) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ("dupfoo", "DupFoo", "class", None, "swift", "Other", "Other/Foo.swift", 1, 0, 0),
+        (dupfoo_id, "DupFoo", "class", None, "swift", "Other", "Other/Foo.swift", 1, 0, 0),
     )
     populated_conn.commit()
     matches = query_module.find_files_in_index(populated_conn, "Foo.swift")
@@ -290,9 +304,12 @@ def test_role_bit_unknown_raises():
 
 def test_resolve_input_passthrough_swift_usr_keeps_existing(populated_conn):
     cur = populated_conn.cursor()
+    cur.execute("INSERT INTO usrs(text) VALUES ('s:Real')")
+    real_id = cur.lastrowid
     cur.execute(
-        "INSERT INTO symbols(usr, name, kind, sub_kind, language, module, file, line, is_system, properties) "
-        "VALUES ('s:Real', 'Real', 'class', NULL, 'swift', 'Core', 'Core/Real.swift', 1, 0, 0)"
+        "INSERT INTO symbols(usr_id, name, kind, sub_kind, language, module, file, line, is_system, properties) "
+        "VALUES (?, 'Real', 'class', NULL, 'swift', 'Core', 'Core/Real.swift', 1, 0, 0)",
+        (real_id,),
     )
     populated_conn.commit()
     target = query_module.resolve_input_to_usr(populated_conn, "s:Real")
@@ -313,9 +330,12 @@ def test_resolve_input_name_unique_match(populated_conn):
 
 def test_resolve_input_name_ambiguous_raises_with_candidates(populated_conn):
     cur = populated_conn.cursor()
+    cur.execute("INSERT INTO usrs(text) VALUES ('caller2')")
+    caller2_id = cur.lastrowid
     cur.execute(
-        "INSERT INTO symbols(usr, name, kind, sub_kind, language, module, file, line, is_system, properties) "
-        "VALUES ('caller2', 'Caller', 'class', NULL, 'swift', 'Other', 'Other/Caller.swift', 1, 0, 0)"
+        "INSERT INTO symbols(usr_id, name, kind, sub_kind, language, module, file, line, is_system, properties) "
+        "VALUES (?, 'Caller', 'class', NULL, 'swift', 'Other', 'Other/Caller.swift', 1, 0, 0)",
+        (caller2_id,),
     )
     populated_conn.commit()
     with pytest.raises(query_module.AmbiguousNameError) as exc_info:
@@ -373,10 +393,10 @@ def test_fetch_callees_layer_inverts_direction(populated_conn):
 
 def test_fetch_type_reference_containers_returns_distinct(populated_conn):
     cur = populated_conn.cursor()
-    # Add a reference of Foo inside run() (container=run)
+    # Add a reference of Foo inside run() (container=run). Reuse the seed ids 1-6.
     cur.execute(
-        "INSERT INTO occurrences(id, symbol_usr, file, line, column, roles, container_usr, unit_name) "
-        "VALUES (10, 'foo', 'UI/Caller.swift', 6, 10, 4, 'run', 'u3')"
+        "INSERT INTO occurrences(id, symbol_usr_id, file, line, column, roles, container_usr_id, unit_name) "
+        "VALUES (10, 1, 'UI/Caller.swift', 6, 10, 4, 6, 'u3')"
     )
     populated_conn.commit()
     rows = query_module.fetch_type_reference_containers(populated_conn, "foo")

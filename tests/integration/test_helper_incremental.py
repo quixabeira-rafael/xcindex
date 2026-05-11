@@ -141,7 +141,7 @@ def test_incremental_preserves_unaffected_files(fresh_fixture, built_helper, tmp
     # Capture all rows for an unaffected file (PriceCalculator.swift) before.
     def snapshot(conn) -> str:
         rows = list(conn.execute("""
-            SELECT id, symbol_usr, line, column, roles, container_usr
+            SELECT id, symbol_usr_id, line, column, roles, container_usr_id
             FROM occurrences
             WHERE file LIKE '%PriceCalculator.swift'
             ORDER BY id

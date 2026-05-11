@@ -57,7 +57,7 @@ def test_bootstrap_writes_valid_sqlite(built_fixture, built_helper, tmp_path: Pa
     assert result.relations > 0
 
 
-def test_bootstrap_writes_schema_version_3(built_fixture, built_helper, tmp_path: Path):
+def test_bootstrap_writes_current_schema_version(built_fixture, built_helper, tmp_path: Path):
     output = tmp_path / "fixture.sqlite"
     helper.run_bootstrap(
         index_store_path=built_fixture,
@@ -69,7 +69,8 @@ def test_bootstrap_writes_schema_version_3(built_fixture, built_helper, tmp_path
         version = conn.execute(
             "SELECT value FROM meta WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("3",)
+        from xcindex import schema as schema_module
+        assert version == (str(schema_module.SCHEMA_VERSION),)
     finally:
         conn.close()
 
@@ -193,6 +194,7 @@ def test_bootstrap_overwrites_existing_output(built_fixture, built_helper, tmp_p
         version = conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'"
         ).fetchone()
-        assert version == ("3",)
+        from xcindex import schema as schema_module
+        assert version == (str(schema_module.SCHEMA_VERSION),)
     finally:
         conn.close()
