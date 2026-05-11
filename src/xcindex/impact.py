@@ -150,10 +150,11 @@ def _find_terminal_callers(
     cursor = conn.cursor()
     cursor.execute(
         f"""
-        SELECT DISTINCT o.symbol_usr
+        SELECT DISTINCT u.text
         FROM relations r
         JOIN occurrences o ON o.id = r.occurrence_id
-        WHERE o.symbol_usr IN ({placeholders})
+        JOIN usrs u ON u.id = o.symbol_usr_id
+        WHERE u.text IN ({placeholders})
           AND r.kind IN ({kind_placeholders})
         """,
         (*candidate_usrs, *kinds),
@@ -176,9 +177,10 @@ def _find_terminal_callees(
     cursor = conn.cursor()
     cursor.execute(
         f"""
-        SELECT DISTINCT r.related_usr
+        SELECT DISTINCT u.text
         FROM relations r
-        WHERE r.related_usr IN ({placeholders})
+        JOIN usrs u ON u.id = r.related_usr_id
+        WHERE u.text IN ({placeholders})
           AND r.kind IN ({kind_placeholders})
         """,
         (*candidate_usrs, *kinds),

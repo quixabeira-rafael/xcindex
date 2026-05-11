@@ -33,34 +33,35 @@ def open_readonly(sqlite_path: Path) -> sqlite3.Connection:
 # --- Query helpers (return canonical dicts compatible with output engine) ---
 
 
+def _resolve_usr_id(conn: sqlite3.Connection, usr: str) -> int | None:
+    """Look up the integer id for a USR text. Returns None when absent."""
+    row = conn.execute("SELECT id FROM usrs WHERE text = ?", (usr,)).fetchone()
+    return row[0] if row else None
+
+
 def query_at(conn: sqlite3.Connection, file: str, line: int, column: int | None = None) -> dict[str, Any]:
     """Find occurrences at a given file:line[:column].
 
     Returns canonical shape with anchor (file/line) and items (one per occurrence).
     """
     cursor = conn.cursor()
+    base_select = """
+        SELECT o.id, u_sym.text AS symbol_usr, o.file, o.line, o.column, o.roles,
+               u_ctr.text AS container_usr,
+               s.name, s.kind, s.module, s.language
+        FROM occurrences o
+        LEFT JOIN symbols s ON s.usr_id = o.symbol_usr_id
+        LEFT JOIN usrs u_sym ON u_sym.id = o.symbol_usr_id
+        LEFT JOIN usrs u_ctr ON u_ctr.id = o.container_usr_id
+    """
     if column is not None:
         cursor.execute(
-            """
-            SELECT o.id, o.symbol_usr, o.file, o.line, o.column, o.roles, o.container_usr,
-                   s.name, s.kind, s.module, s.language
-            FROM occurrences o
-            LEFT JOIN symbols s ON s.usr = o.symbol_usr
-            WHERE o.file = ? AND o.line = ? AND o.column = ?
-            ORDER BY o.column
-            """,
+            base_select + " WHERE o.file = ? AND o.line = ? AND o.column = ? ORDER BY o.column",
             (file, line, column),
         )
     else:
         cursor.execute(
-            """
-            SELECT o.id, o.symbol_usr, o.file, o.line, o.column, o.roles, o.container_usr,
-                   s.name, s.kind, s.module, s.language
-            FROM occurrences o
-            LEFT JOIN symbols s ON s.usr = o.symbol_usr
-            WHERE o.file = ? AND o.line = ?
-            ORDER BY o.column
-            """,
+            base_select + " WHERE o.file = ? AND o.line = ? ORDER BY o.column",
             (file, line),
         )
     rows = cursor.fetchall()
@@ -93,8 +94,9 @@ def query_containing(conn: sqlite3.Connection, file: str, line: int) -> dict[str
     cursor = conn.cursor()
     cursor.execute(
         """
-        SELECT s.usr, s.name, s.kind, s.module, s.language, s.file, s.line
+        SELECT u.text AS usr, s.name, s.kind, s.module, s.language, s.file, s.line
         FROM symbols s
+        JOIN usrs u ON u.id = s.usr_id
         WHERE s.file = ? AND s.line <= ?
         ORDER BY s.line DESC
         LIMIT 1
@@ -129,9 +131,11 @@ def query_symbol_by_usr(conn: sqlite3.Connection, usr: str) -> dict[str, Any]:
     cursor = conn.cursor()
     cursor.execute(
         """
-        SELECT usr, name, kind, sub_kind, language, module, file, line, is_system, properties
-        FROM symbols
-        WHERE usr = ?
+        SELECT u.text AS usr, s.name, s.kind, s.sub_kind, s.language, s.module,
+               s.file, s.line, s.is_system, s.properties
+        FROM symbols s
+        JOIN usrs u ON u.id = s.usr_id
+        WHERE u.text = ?
         """,
         (usr,),
     )
@@ -156,10 +160,12 @@ def query_symbol_by_name(conn: sqlite3.Connection, name: str, *, limit: int = 50
     cursor = conn.cursor()
     cursor.execute(
         """
-        SELECT usr, name, kind, sub_kind, language, module, file, line, is_system, properties
-        FROM symbols
-        WHERE name = ?
-        ORDER BY module, kind, file, line
+        SELECT u.text AS usr, s.name, s.kind, s.sub_kind, s.language, s.module,
+               s.file, s.line, s.is_system, s.properties
+        FROM symbols s
+        JOIN usrs u ON u.id = s.usr_id
+        WHERE s.name = ?
+        ORDER BY s.module, s.kind, s.file, s.line
         LIMIT ?
         """,
         (name, limit + 1),
@@ -191,7 +197,16 @@ def query_occurrences(
 ) -> dict[str, Any]:
     """Find all occurrences of a symbol, optionally filtered by a single role."""
     cursor = conn.cursor()
-    params: list[Any] = [usr]
+    usr_id = _resolve_usr_id(conn, usr)
+    if usr_id is None:
+        return {
+            "kind": "occurrences",
+            "anchor": {"usr": usr, "name": None, "role": role},
+            "summary": {"found": False, "count": 0, "files": 0, "by_role": {}},
+            "items": [],
+            "truncated": False,
+        }
+    params: list[Any] = [usr_id]
     role_clause = ""
     if role:
         role_clause = "AND (o.roles & ?) != 0"
@@ -199,11 +214,14 @@ def query_occurrences(
     params.append(limit + 1)
     cursor.execute(
         f"""
-        SELECT o.id, o.symbol_usr, o.file, o.line, o.column, o.roles, o.container_usr,
+        SELECT o.id, u_sym.text AS symbol_usr, o.file, o.line, o.column, o.roles,
+               u_ctr.text AS container_usr,
                s.name, s.kind, s.module, s.language
         FROM occurrences o
-        LEFT JOIN symbols s ON s.usr = o.symbol_usr
-        WHERE o.symbol_usr = ?
+        LEFT JOIN symbols s ON s.usr_id = o.symbol_usr_id
+        LEFT JOIN usrs u_sym ON u_sym.id = o.symbol_usr_id
+        LEFT JOIN usrs u_ctr ON u_ctr.id = o.container_usr_id
+        WHERE o.symbol_usr_id = ?
         {role_clause}
         ORDER BY o.file, o.line, o.column
         LIMIT ?
@@ -246,7 +264,16 @@ def query_relations(
     if direction not in ("in", "out"):
         raise ValueError(f"unknown direction: {direction!r}")
     cursor = conn.cursor()
-    params: list[Any] = [usr]
+    usr_id = _resolve_usr_id(conn, usr)
+    if usr_id is None:
+        return {
+            "kind": "relations",
+            "anchor": {"usr": usr, "direction": direction, "filter_kind": kind},
+            "summary": {"found": False, "count": 0, "by_kind": {}},
+            "items": [],
+            "truncated": False,
+        }
+    params: list[Any] = [usr_id]
     kind_clause = ""
     if kind:
         kind_clause = "AND r.kind = ?"
@@ -255,7 +282,7 @@ def query_relations(
 
     if direction == "out":
         sql = f"""
-            SELECT r.related_usr AS counterpart_usr,
+            SELECT u.text AS counterpart_usr,
                    COALESCE(s.name, r.related_name) AS counterpart_name,
                    s.kind AS counterpart_kind, s.module AS counterpart_module,
                    s.file AS counterpart_file, s.line AS counterpart_line,
@@ -263,15 +290,16 @@ def query_relations(
                    o.file AS site_file, o.line AS site_line, o.column AS site_column
             FROM occurrences o
             JOIN relations r ON r.occurrence_id = o.id
-            LEFT JOIN symbols s ON s.usr = r.related_usr
-            WHERE o.symbol_usr = ?
+            LEFT JOIN symbols s ON s.usr_id = r.related_usr_id
+            JOIN usrs u ON u.id = r.related_usr_id
+            WHERE o.symbol_usr_id = ?
             {kind_clause}
             ORDER BY r.kind, counterpart_module, counterpart_name
             LIMIT ?
         """
     else:
         sql = f"""
-            SELECT o.symbol_usr AS counterpart_usr,
+            SELECT u.text AS counterpart_usr,
                    s.name AS counterpart_name,
                    s.kind AS counterpart_kind, s.module AS counterpart_module,
                    s.file AS counterpart_file, s.line AS counterpart_line,
@@ -279,8 +307,9 @@ def query_relations(
                    o.file AS site_file, o.line AS site_line, o.column AS site_column
             FROM relations r
             JOIN occurrences o ON o.id = r.occurrence_id
-            LEFT JOIN symbols s ON s.usr = o.symbol_usr
-            WHERE r.related_usr = ?
+            LEFT JOIN symbols s ON s.usr_id = o.symbol_usr_id
+            JOIN usrs u ON u.id = o.symbol_usr_id
+            WHERE r.related_usr_id = ?
             {kind_clause}
             ORDER BY r.kind, counterpart_module, counterpart_name
             LIMIT ?
@@ -358,54 +387,58 @@ def query_reach(
     if direction not in ("up", "down"):
         raise ValueError(f"unknown direction: {direction!r}")
     cursor = conn.cursor()
+    usr_id = _resolve_usr_id(conn, usr)
+    if usr_id is None:
+        return {
+            "kind": "reach",
+            "anchor": {"usr": usr, "direction": direction, "max_depth": max_depth, "to_module": to_module},
+            "summary": {"found": False, "count": 0, "min_hops": None, "max_hops": None,
+                         "by_module": {}, "by_depth": {}},
+            "items": [],
+            "truncated": False,
+        }
     travel_kinds = tuple(kinds) if kinds else DEFAULT_REACH_KINDS
     placeholders = ",".join(["?"] * len(travel_kinds))
 
     if direction == "up":
-        # "Up" means: who transitively USES this symbol.
-        # An occurrence with symbol_usr=X carries relations whose related_usr is the
-        # entity that "uses" X (e.g. relation kind=calledBy → related_usr is the caller).
         recursive_step = f"""
-            SELECT r.related_usr, reach.depth + 1
+            SELECT r.related_usr_id, reach.depth + 1
             FROM reach
-            JOIN occurrences o ON o.symbol_usr = reach.usr
+            JOIN occurrences o ON o.symbol_usr_id = reach.usr_id
             JOIN relations r ON r.occurrence_id = o.id
             WHERE reach.depth < ?
               AND r.kind IN ({placeholders})
         """
     else:
-        # "Down" means: what this symbol transitively USES.
-        # When X calls Y, the occurrence is OF Y (symbol_usr=Y) with relation
-        # (related_usr=X, kind=calledBy). To get what X uses we look for relations
-        # where related_usr=X and follow back to o.symbol_usr (the callee).
         recursive_step = f"""
-            SELECT o.symbol_usr, reach.depth + 1
+            SELECT o.symbol_usr_id, reach.depth + 1
             FROM reach
-            JOIN relations r ON r.related_usr = reach.usr
+            JOIN relations r ON r.related_usr_id = reach.usr_id
             JOIN occurrences o ON o.id = r.occurrence_id
             WHERE reach.depth < ?
               AND r.kind IN ({placeholders})
         """
 
     module_clause = ""
-    params: list[Any] = [usr, max_depth, *travel_kinds, usr]
+    params: list[Any] = [usr_id, max_depth, *travel_kinds, usr_id]
     if to_module is not None:
         module_clause = " AND s.module = ?"
         params.append(to_module)
     params.append(limit + 1)
 
     cte_sql = f"""
-        WITH RECURSIVE reach(usr, depth) AS (
+        WITH RECURSIVE reach(usr_id, depth) AS (
             SELECT ?, 0
             UNION
             {recursive_step}
         )
-        SELECT reach.usr, MIN(reach.depth) AS depth,
+        SELECT u.text AS usr, MIN(reach.depth) AS depth,
                s.name, s.kind, s.module, s.file, s.line
         FROM reach
-        LEFT JOIN symbols s ON s.usr = reach.usr
-        WHERE reach.usr != ?{module_clause}
-        GROUP BY reach.usr
+        LEFT JOIN symbols s ON s.usr_id = reach.usr_id
+        JOIN usrs u ON u.id = reach.usr_id
+        WHERE reach.usr_id != ?{module_clause}
+        GROUP BY reach.usr_id
         ORDER BY depth, s.module, s.name
         LIMIT ?
     """
@@ -504,15 +537,17 @@ def query_file_definitions(
     where_kind = ""
     if kinds:
         placeholders = ",".join(["?"] * len(kinds))
-        where_kind = f"AND kind IN ({placeholders})"
+        where_kind = f"AND s.kind IN ({placeholders})"
         params.extend(kinds)
     params.append(limit + 1)
     cursor.execute(
         f"""
-        SELECT usr, name, kind, sub_kind, language, module, file, line, is_system, properties
-        FROM symbols
-        WHERE file = ? {where_kind} AND is_system = 0
-        ORDER BY line, name
+        SELECT u.text AS usr, s.name, s.kind, s.sub_kind, s.language, s.module,
+               s.file, s.line, s.is_system, s.properties
+        FROM symbols s
+        JOIN usrs u ON u.id = s.usr_id
+        WHERE s.file = ? {where_kind} AND s.is_system = 0
+        ORDER BY s.line, s.name
         LIMIT ?
         """,
         params,
@@ -548,21 +583,23 @@ def query_search(
     """Substring match (case-insensitive) on symbol name."""
     cursor = conn.cursor()
     params: list[Any] = [f"%{pattern}%"]
-    where = "WHERE name LIKE ? COLLATE NOCASE"
+    where = "WHERE s.name LIKE ? COLLATE NOCASE"
     if kind:
-        where += " AND kind = ?"
+        where += " AND s.kind = ?"
         params.append(kind)
     if module:
-        where += " AND module = ?"
+        where += " AND s.module = ?"
         params.append(module)
-    where += " AND is_system = 0"
+    where += " AND s.is_system = 0"
     params.append(limit + 1)
     cursor.execute(
         f"""
-        SELECT usr, name, kind, sub_kind, language, module, file, line, is_system, properties
-        FROM symbols
+        SELECT u.text AS usr, s.name, s.kind, s.sub_kind, s.language, s.module,
+               s.file, s.line, s.is_system, s.properties
+        FROM symbols s
+        JOIN usrs u ON u.id = s.usr_id
         {where}
-        ORDER BY name COLLATE NOCASE, module
+        ORDER BY s.name COLLATE NOCASE, s.module
         LIMIT ?
         """,
         params,
@@ -633,6 +670,18 @@ def resolve_input_to_usr(conn: sqlite3.Connection, input_str: str) -> dict[str, 
     return items[0]
 
 
+def _resolve_usr_ids(conn: sqlite3.Connection, usrs: list[str]) -> list[int]:
+    """Bulk USR text → id resolution. USRs not present in the index are dropped."""
+    if not usrs:
+        return []
+    placeholders = ",".join(["?"] * len(usrs))
+    rows = conn.execute(
+        f"SELECT id FROM usrs WHERE text IN ({placeholders})",
+        usrs,
+    ).fetchall()
+    return [row[0] for row in rows]
+
+
 def fetch_callers_layer(
     conn: sqlite3.Connection,
     frontier_usrs: list[str],
@@ -647,28 +696,33 @@ def fetch_callers_layer(
     """
     if not frontier_usrs or not kinds:
         return []
-    frontier_placeholders = ",".join(["?"] * len(frontier_usrs))
+    frontier_ids = _resolve_usr_ids(conn, frontier_usrs)
+    if not frontier_ids:
+        return []
+    frontier_placeholders = ",".join(["?"] * len(frontier_ids))
     kind_placeholders = ",".join(["?"] * len(kinds))
     cursor = conn.cursor()
     cursor.execute(
         f"""
-        SELECT o.symbol_usr AS callee,
-               r.related_usr AS caller,
-               r.kind        AS edge_kind,
-               o.file        AS site_file,
-               o.line        AS site_line,
-               s.name        AS caller_name,
-               s.kind        AS caller_kind,
-               s.module      AS caller_module,
-               s.file        AS caller_file,
-               s.line        AS caller_line
+        SELECT u_callee.text AS callee,
+               u_caller.text AS caller,
+               r.kind         AS edge_kind,
+               o.file         AS site_file,
+               o.line         AS site_line,
+               s.name         AS caller_name,
+               s.kind         AS caller_kind,
+               s.module       AS caller_module,
+               s.file         AS caller_file,
+               s.line         AS caller_line
         FROM relations r
         JOIN occurrences o ON o.id = r.occurrence_id
-        LEFT JOIN symbols s ON s.usr = r.related_usr
-        WHERE o.symbol_usr IN ({frontier_placeholders})
+        JOIN usrs u_callee ON u_callee.id = o.symbol_usr_id
+        JOIN usrs u_caller ON u_caller.id = r.related_usr_id
+        LEFT JOIN symbols s ON s.usr_id = r.related_usr_id
+        WHERE o.symbol_usr_id IN ({frontier_placeholders})
           AND r.kind IN ({kind_placeholders})
         """,
-        (*frontier_usrs, *kinds),
+        (*frontier_ids, *kinds),
     )
     return [dict(row) for row in cursor.fetchall()]
 
@@ -686,28 +740,33 @@ def fetch_callees_layer(
     """
     if not frontier_usrs or not kinds:
         return []
-    frontier_placeholders = ",".join(["?"] * len(frontier_usrs))
+    frontier_ids = _resolve_usr_ids(conn, frontier_usrs)
+    if not frontier_ids:
+        return []
+    frontier_placeholders = ",".join(["?"] * len(frontier_ids))
     kind_placeholders = ",".join(["?"] * len(kinds))
     cursor = conn.cursor()
     cursor.execute(
         f"""
-        SELECT r.related_usr AS caller,
-               o.symbol_usr  AS callee,
-               r.kind        AS edge_kind,
-               o.file        AS site_file,
-               o.line        AS site_line,
-               s.name        AS callee_name,
-               s.kind        AS callee_kind,
-               s.module      AS callee_module,
-               s.file        AS callee_file,
-               s.line        AS callee_line
+        SELECT u_caller.text AS caller,
+               u_callee.text AS callee,
+               r.kind         AS edge_kind,
+               o.file         AS site_file,
+               o.line         AS site_line,
+               s.name         AS callee_name,
+               s.kind         AS callee_kind,
+               s.module       AS callee_module,
+               s.file         AS callee_file,
+               s.line         AS callee_line
         FROM relations r
         JOIN occurrences o ON o.id = r.occurrence_id
-        LEFT JOIN symbols s ON s.usr = o.symbol_usr
-        WHERE r.related_usr IN ({frontier_placeholders})
+        JOIN usrs u_caller ON u_caller.id = r.related_usr_id
+        JOIN usrs u_callee ON u_callee.id = o.symbol_usr_id
+        LEFT JOIN symbols s ON s.usr_id = o.symbol_usr_id
+        WHERE r.related_usr_id IN ({frontier_placeholders})
           AND r.kind IN ({kind_placeholders})
         """,
-        (*frontier_usrs, *kinds),
+        (*frontier_ids, *kinds),
     )
     return [dict(row) for row in cursor.fetchall()]
 
@@ -721,26 +780,30 @@ def fetch_type_reference_containers(
     A 'container' is the enclosing symbol (method/function) that hosts a
     reference to the type. Used as the level-1 upstream layer for a type target.
     """
+    type_id = _resolve_usr_id(conn, type_usr)
+    if type_id is None:
+        return []
     cursor = conn.cursor()
     cursor.execute(
         """
-        SELECT DISTINCT o.container_usr AS container_usr,
-               s.name   AS container_name,
-               s.kind   AS container_kind,
+        SELECT u.text  AS container_usr,
+               s.name  AS container_name,
+               s.kind  AS container_kind,
                s.module AS container_module,
-               s.file   AS container_file,
-               s.line   AS container_line,
+               s.file  AS container_file,
+               s.line  AS container_line,
                MIN(o.file) AS site_file,
                MIN(o.line) AS site_line
         FROM occurrences o
-        LEFT JOIN symbols s ON s.usr = o.container_usr
-        WHERE o.symbol_usr = ?
-          AND o.container_usr IS NOT NULL
-          AND o.container_usr != ?
+        JOIN usrs u ON u.id = o.container_usr_id
+        LEFT JOIN symbols s ON s.usr_id = o.container_usr_id
+        WHERE o.symbol_usr_id = ?
+          AND o.container_usr_id IS NOT NULL
+          AND o.container_usr_id != ?
           AND (o.roles & 4) != 0
-        GROUP BY o.container_usr
+        GROUP BY o.container_usr_id
         """,
-        (type_usr, type_usr),
+        (type_id, type_id),
     )
     return [dict(row) for row in cursor.fetchall()]
 
@@ -759,46 +822,52 @@ def fetch_type_structure(
       - extensions: type's occurrence (in the extension's site) carries an
         `extendedBy` relation; the extension's USR is `r.related_usr`.
     """
+    type_id = _resolve_usr_id(conn, type_usr)
+    if type_id is None:
+        return {"members": [], "subclasses": [], "extensions": []}
     cursor = conn.cursor()
     cursor.execute(
         """
-        SELECT DISTINCT s.usr, s.name, s.kind, s.module, s.file, s.line
+        SELECT DISTINCT u.text AS usr, s.name, s.kind, s.module, s.file, s.line
         FROM relations r
         JOIN occurrences o ON o.id = r.occurrence_id
-        LEFT JOIN symbols s ON s.usr = o.symbol_usr
-        WHERE r.related_usr = ?
+        JOIN symbols s ON s.usr_id = o.symbol_usr_id
+        JOIN usrs u ON u.id = o.symbol_usr_id
+        WHERE r.related_usr_id = ?
           AND r.kind IN ('childOf', 'containedBy')
         ORDER BY s.line, s.name
         """,
-        (type_usr,),
+        (type_id,),
     )
     members = [dict(row) for row in cursor.fetchall() if row["usr"]]
 
     cursor.execute(
         """
-        SELECT DISTINCT s.usr, s.name, s.kind, s.module, s.file, s.line
+        SELECT DISTINCT u.text AS usr, s.name, s.kind, s.module, s.file, s.line
         FROM relations r
         JOIN occurrences o ON o.id = r.occurrence_id
-        LEFT JOIN symbols s ON s.usr = r.related_usr
-        WHERE o.symbol_usr = ?
+        JOIN symbols s ON s.usr_id = r.related_usr_id
+        JOIN usrs u ON u.id = r.related_usr_id
+        WHERE o.symbol_usr_id = ?
           AND r.kind = 'baseOf'
         ORDER BY s.module, s.name
         """,
-        (type_usr,),
+        (type_id,),
     )
     subclasses = [dict(row) for row in cursor.fetchall() if row["usr"]]
 
     cursor.execute(
         """
-        SELECT DISTINCT s.usr, s.name, s.kind, s.module, s.file, s.line
+        SELECT DISTINCT u.text AS usr, s.name, s.kind, s.module, s.file, s.line
         FROM relations r
         JOIN occurrences o ON o.id = r.occurrence_id
-        LEFT JOIN symbols s ON s.usr = r.related_usr
-        WHERE o.symbol_usr = ?
+        JOIN symbols s ON s.usr_id = r.related_usr_id
+        JOIN usrs u ON u.id = r.related_usr_id
+        WHERE o.symbol_usr_id = ?
           AND r.kind = 'extendedBy'
         ORDER BY s.module, s.name
         """,
-        (type_usr,),
+        (type_id,),
     )
     extensions = [dict(row) for row in cursor.fetchall() if row["usr"]]
 

@@ -742,30 +742,36 @@ def _impact_structure_block(structure: dict[str, list[dict[str, Any]]]) -> str:
     extensions = structure.get("extensions") or []
     if not (members or subclasses or extensions):
         return ""
+    def _safe(value, default="(unnamed)"):
+        return value if value is not None else default
+
     lines = ["**structure**"]
     if members:
         lines.append(f"  members ({len(members)}):")
         for row in members[:50]:
-            lines.append(
-                f"    {row.get('name'):<32s} {row.get('kind') or '?':<20s} "
-                f"{(row.get('file') or '(external)')}:{row.get('line') or '?'}"
-            )
+            name = _safe(row.get("name"))
+            kind = _safe(row.get("kind"), "?")
+            file = _safe(row.get("file"), "(external)")
+            line_no = _safe(row.get("line"), "?")
+            lines.append(f"    {name:<32s} {kind:<20s} {file}:{line_no}")
         if len(members) > 50:
             lines.append(f"    ... ({len(members) - 50} more)")
     if subclasses:
         lines.append(f"  subclasses ({len(subclasses)}):")
         for row in subclasses[:25]:
-            lines.append(
-                f"    {row.get('name'):<32s} {(row.get('file') or '(external)')}:{row.get('line') or '?'}"
-            )
+            name = _safe(row.get("name"))
+            file = _safe(row.get("file"), "(external)")
+            line_no = _safe(row.get("line"), "?")
+            lines.append(f"    {name:<32s} {file}:{line_no}")
         if len(subclasses) > 25:
             lines.append(f"    ... ({len(subclasses) - 25} more)")
     if extensions:
         lines.append(f"  extensions ({len(extensions)}):")
         for row in extensions[:25]:
-            lines.append(
-                f"    {row.get('name'):<32s} {(row.get('file') or '(external)')}:{row.get('line') or '?'}"
-            )
+            name = _safe(row.get("name"))
+            file = _safe(row.get("file"), "(external)")
+            line_no = _safe(row.get("line"), "?")
+            lines.append(f"    {name:<32s} {file}:{line_no}")
         if len(extensions) > 25:
             lines.append(f"    ... ({len(extensions) - 25} more)")
     return "\n".join(lines)
