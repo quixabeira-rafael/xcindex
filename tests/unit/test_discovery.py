@@ -110,6 +110,17 @@ def test_find_index_store_picks_matching_workspace(tmp_repo: Path, make_xcodepro
     assert correct_entry in store.parents
 
 
+def test_find_index_store_accepts_direct_entry(tmp_repo: Path, make_xcodeproj, tmp_path: Path):
+    make_xcodeproj("MyApp")
+    entry = tmp_path / "ww-wt-FU-26-DD"
+    units = entry / "Index.noindex" / "DataStore" / "v5" / "units"
+    units.mkdir(parents=True)
+    (units / "unit-1").write_bytes(b"")
+    info = discovery.find_project(tmp_repo)
+    store = discovery.find_index_store(info, derived_data_override=entry)
+    assert store == entry / "Index.noindex" / "DataStore"
+
+
 def test_env_var_overrides_index_store(monkeypatch, tmp_repo: Path, make_xcodeproj, tmp_path: Path):
     make_xcodeproj("Sample")
     info = discovery.find_project(tmp_repo)

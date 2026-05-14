@@ -74,7 +74,9 @@ def add_project_arguments(
     parser.add_argument("--index-store", type=Path, default=None,
                         help="Path to the IndexStore DataStore directory (overrides discovery).")
     parser.add_argument("--derived-data", type=Path, default=None,
-                        help="Path to DerivedData root (overrides default).")
+                        help="Path to DerivedData root, or directly to a project-specific "
+                             "DerivedData entry (containing Index.noindex/DataStore). "
+                             "Overrides XCINDEX_DERIVED_DATA and the default.")
     parser.add_argument("--include-system", action="store_true",
                         help="Include SDK / system symbols in the dump (default: false).")
     if include_freshness_flags:

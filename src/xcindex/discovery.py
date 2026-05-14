@@ -63,7 +63,10 @@ def find_index_store(
         1. explicit `index_store_override`
         2. XCINDEX_INDEX_STORE env var
         3. SwiftPM project: <root>/.build/debug/index/store
-        4. Xcode project: scan DerivedData (override / env var / default) for matching workspace
+        4. Xcode project: DerivedData (override / env var / default), accepting either
+           a root directory to scan for `<project.name>-*`, or a project-specific
+           entry that already contains `Index.noindex/DataStore` (used by worktrees
+           with custom DerivedData locations).
     """
     if index_store_override is not None:
         return _validate_index_store(index_store_override.expanduser().resolve())
@@ -77,6 +80,9 @@ def find_index_store(
         return _validate_index_store(candidate)
 
     derived_data = _resolve_derived_data(derived_data_override)
+    direct_store = derived_data / "Index.noindex" / "DataStore"
+    if direct_store.is_dir():
+        return _validate_index_store(direct_store)
     project_dir = _find_derived_data_for_project(project, derived_data)
     return _validate_index_store(project_dir / "Index.noindex" / "DataStore")
 

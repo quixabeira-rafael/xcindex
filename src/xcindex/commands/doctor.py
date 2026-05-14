@@ -31,7 +31,9 @@ def register(subparsers) -> None:
     parser.add_argument("--index-store", type=Path, default=None,
                         help="Path to the IndexStore DataStore directory (overrides discovery).")
     parser.add_argument("--derived-data", type=Path, default=None,
-                        help="Path to DerivedData root (overrides ~/Library/Developer/Xcode/DerivedData).")
+                        help="Path to DerivedData root, or directly to a project-specific "
+                             "DerivedData entry containing Index.noindex/DataStore "
+                             "(overrides ~/Library/Developer/Xcode/DerivedData).")
     parser.set_defaults(func=cmd_doctor)
 
 
